@@ -166,6 +166,7 @@ class AIDModel:
         self.cv_results = None
         self.train_score = None
         self.test_score = None
+        self.decision_threshold = None
     
     def prepare_data(self, df: pd.DataFrame, engineer_features: bool = True):
         """Prepare data for training/testing"""
@@ -330,7 +331,9 @@ class AIDModel:
         print(f"\n{'='*60}")
         print(f"📊 VALIDATION SET PERFORMANCE")
         print(f"{'='*60}")
-        y_val_pred = self.model.predict(X_val)
+        y_val_proba = self.model.predict_proba(X_val)[:,1] # Validation probabilities
+        self.select_decision_threshold(X_val, y_val) # Learn threshold from validation set
+        y_val_pred = (y_val_proba >= self.decision_threshold).astype(int) # Apply threshold
         val_accuracy = accuracy_score(y_val, y_val_pred)
         val_precision = precision_score(y_val, y_val_pred, zero_division=0)
         val_recall = recall_score(y_val, y_val_pred, zero_division=0)
@@ -342,6 +345,33 @@ class AIDModel:
         print(f"  F1-score:  {val_f1:.4f}")
         print(f"  (Validation is used during training for model selection)")
     
+    def select_decision_threshold(self, X_val: np.ndarray, y_val: np.ndarray):
+        """
+        Select decision threshold using validation set.
+        Criterion: maximize TPR subject to FAR ≤ 1%
+        """
+        print("\n🎯 Selecting decision threshold from validation set...")
+
+        y_proba = self.model.predict_proba(X_val)[:, 1]
+        fpr, tpr, thresholds = roc_curve(y_val, y_proba)
+
+        # FAR constraint (1%)
+        max_far = 0.01
+        valid = fpr <= max_far
+
+        if not np.any(valid):
+            print("⚠️ No threshold satisfies FAR constraint, using default 0.5")
+            self.decision_threshold = 0.5
+            return
+
+        best_idx = np.argmax(tpr[valid])
+        self.decision_threshold = thresholds[valid][best_idx]
+
+        print(f" ✅ Selected threshold = {self.decision_threshold:.3f}")
+        print(f" FAR = {fpr[valid][best_idx]*100:.2f}%")
+        print(f" Recall = {tpr[valid][best_idx]*100:.2f}%")
+
+
     def _create_refined_grid(self, best_params: dict) -> dict:
         """Create a narrow grid around best parameters for refinement"""
         refined_grid = {}
@@ -642,9 +672,19 @@ class AIDModel:
         
         print(f"Test set: {len(X_test):,} samples ({y_test.sum():,} incidents)\n")
         
-        y_pred = self.model.predict(X_test.values)
+        X_test_np = X_test.to_numpy(dtype=np.float32, copy=False)
+        y_pred_proba = self.model.predict_proba(X_test_np)[:, 1]
+        y_pred = (y_pred_proba >= self.decision_threshold).astype(int)
         y_pred_proba = self.model.predict_proba(X_test)[:, 1]
         
+        print("\n📊 Operating Points:")
+        for thr in [0.3, 0.5, 0.7, 0.85, self.decision_threshold]:
+            y_tmp = (y_pred_proba >= thr).astype(int)
+            tn, fp, fn, tp = confusion_matrix(y_test, y_tmp).ravel()
+            far = fp / (fp + tn)
+            recall = tp / (tp + fn)
+            print(f" Threshold {thr:.2f} → FAR: {far*100:.2f}% | Recall: {recall*100:.2f}%")
+
         accuracy = accuracy_score(y_test, y_pred)
         precision = precision_score(y_test, y_pred, zero_division=0)
         recall = recall_score(y_test, y_pred, zero_division=0)
@@ -761,8 +801,11 @@ class AIDModel:
             self._plot_feature_importance(feature_importance.head(20))
             if auc:
                 self._plot_roc_curve(y_test, y_pred_proba)
+        
+        self.plot_far_vs_threshold(y_test, y_pred_proba)
 
         self.test_score = f1_score(y_test, y_pred)
+        print("Threshold used:", self.decision_threshold)
         return results
     
     def _plot_confusion_matrix(self, cm):
@@ -814,12 +857,40 @@ class AIDModel:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
         print(f"💾 ROC curve saved to {save_path}")
+
+    def plot_far_vs_threshold(self, y_true, y_proba):
+        """
+        Plot False Alarm Rate vs decision threshold
+        """
+        fpr, tpr, thresholds = roc_curve(y_true, y_proba)
+
+        plt.figure(figsize=(8, 6))
+        plt.plot(thresholds, fpr, label="False Alarm Rate")
+        plt.axvline(self.decision_threshold, color='red', linestyle='--',
+            label=f"Selected threshold = {self.decision_threshold:.2f}")
+        plt.xlabel("Decision Threshold")
+        plt.ylabel("False Alarm Rate")
+        plt.title("False Alarm Rate vs Threshold")
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+
+        save_path = config.results_dir / "far_vs_threshold.png"
+        plt.savefig(save_path, dpi=300)
+        plt.close()
+
+        print(f"💾 FAR vs threshold plot saved to {save_path}")
     
     def save_model(self):
         """Save trained model and metadata"""
         model_file = config.models_dir / "rf_model.pkl"
         params_file = config.models_dir / "best_params.json"
         features_file = config.models_dir / "feature_columns.json"
+        threshold_file = config.models_dir / "decision_threshold.json"
+
+        with open(threshold_file, 'w') as f:
+            json.dump({'threshold': float(self.decision_threshold)}, f)
+        print(f"💾 Decision threshold saved to {threshold_file}")
         
         # Save model
         joblib.dump(self.model, model_file, compress=3)
@@ -840,6 +911,10 @@ class AIDModel:
         model_file = config.models_dir / "rf_model.pkl"
         params_file = config.models_dir / "best_params.json"
         features_file = config.models_dir / "feature_columns.json"
+        threshold_file = config.models_dir / "decision_threshold.json"
+        
+        with open(threshold_file, 'r') as f:
+            self.decision_threshold = json.load(f)['threshold']
         
         with open(model_file, 'rb') as f:
             self.model = joblib.load(model_file)
