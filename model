@@ -1,0 +1,926 @@
+"""
+Random Forest model training and evaluation for AID thesis
+Includes feature engineering, hyperparameter tuning, comprehensive evaluation, and advanced diagnostics
+"""
+
+import pandas as pd
+import numpy as np
+import pickle
+import json
+import joblib
+import time
+from pathlib import Path
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import RandomizedSearchCV, learning_curve, validation_curve
+from sklearn.metrics import (
+    classification_report, confusion_matrix, accuracy_score,
+    precision_score, recall_score, f1_score, roc_auc_score,
+    roc_curve
+)
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+import warnings
+
+import config
+
+
+class FeatureEngineer:
+    """Handles feature engineering from raw detector data"""
+    
+    def __init__(self):
+        self.feature_names = []
+    
+    def create_rolling_features(self, df: pd.DataFrame, window_size: int) -> pd.DataFrame:
+        """Create rolling window features for each detector"""
+        result = df.copy()
+        
+        for det_edge in config.detector_edges:
+            result[f'{det_edge}_speed_mean_{window_size}s'] = (
+                df[f'{det_edge}_speed_mean'].rolling(window=window_size, min_periods=1).mean()
+            )
+            result[f'{det_edge}_speed_std_{window_size}s'] = (
+                df[f'{det_edge}_speed_std'].rolling(window=window_size, min_periods=1).mean()
+            )
+            result[f'{det_edge}_speed_min_{window_size}s'] = (
+                df[f'{det_edge}_speed_min'].rolling(window=window_size, min_periods=1).min()
+            )
+            result[f'{det_edge}_flow_{window_size}s'] = (
+                df[f'{det_edge}_flow'].rolling(window=window_size, min_periods=1).sum()
+            )
+            result[f'{det_edge}_occupancy_{window_size}s'] = (
+                df[f'{det_edge}_occupancy'].rolling(window=window_size, min_periods=1).mean()
+            )
+        
+        return result
+    
+    def create_spatial_derivatives(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create spatial derivative features between adjacent detectors"""
+        result = df.copy()
+        
+        result['delta_speed_det1_det2'] = df['det1_speed_mean'] - df['det2_speed_mean']
+        result['delta_speed_det2_det3'] = df['det2_speed_mean'] - df['det3_speed_mean']
+        result['delta_flow_det1_det2'] = df['det1_flow'] - df['det2_flow']
+        result['delta_flow_det2_det3'] = df['det2_flow'] - df['det3_flow']
+        result['delta_occupancy_det1_det2'] = df['det1_occupancy'] - df['det2_occupancy']
+        result['delta_occupancy_det2_det3'] = df['det2_occupancy'] - df['det3_occupancy']
+        
+        return result
+    
+    def create_temporal_derivatives(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create temporal derivative features (rate of change)"""
+        result = df.copy()
+        
+        for det_edge in config.detector_edges:
+            result[f'{det_edge}_speed_rate'] = df[f'{det_edge}_speed_mean'].diff()
+            result[f'{det_edge}_flow_rate'] = df[f'{det_edge}_flow'].diff()
+            result[f'{det_edge}_occupancy_rate'] = df[f'{det_edge}_occupancy'].diff()
+        
+        return result
+    
+    def create_advanced_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Create advanced domain-specific features for incident detection"""
+        result = df.copy()
+        
+        result['speed_variance_ratio_1_2'] = (
+            (df['det1_speed_std'] + 0.1) / (df['det2_speed_std'] + 0.1)
+        )
+        result['speed_variance_ratio_2_3'] = (
+            (df['det2_speed_std'] + 0.1) / (df['det3_speed_std'] + 0.1)
+        )
+        
+        for det in config.detector_edges:
+            result[f'{det}_speed_normalized'] = df[f'{det}_speed_mean'] / config.speed_limit_ms
+        
+        for det in config.detector_edges:
+            result[f'{det}_speed_cv'] = df[f'{det}_speed_std'] / (df[f'{det}_speed_mean'] + 0.1)
+        
+        result['flow_imbalance_1_2'] = np.abs(
+            df['det1_flow'] - df['det2_flow']
+        ) / (df['det1_flow'] + df['det2_flow'] + 0.1)
+        
+        result['flow_imbalance_2_3'] = np.abs(
+            df['det2_flow'] - df['det3_flow']
+        ) / (df['det2_flow'] + df['det3_flow'] + 0.1)
+        
+        for det in config.detector_edges:
+            result[f'{det}_queue_indicator'] = (
+                df[f'{det}_occupancy'] * (1 - result[f'{det}_speed_normalized'])
+            )
+        
+        result['shockwave_1_2'] = np.abs(result['delta_speed_det1_det2']) / 500
+        result['shockwave_2_3'] = np.abs(result['delta_speed_det2_det3']) / 500
+        
+        result['congestion_spread'] = (
+            (result['delta_speed_det1_det2'] < -5) & 
+            (result['delta_speed_det2_det3'] < -5)
+        ).astype(int)
+        
+        return result
+    
+    def engineer_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Apply all feature engineering steps"""
+        print("🔧 Engineering features...")
+        
+        scenario_dfs = []
+        
+        for scenario_id in tqdm(df['scenario_id'].unique(), desc="Processing scenarios"):
+            scenario_df = df[df['scenario_id'] == scenario_id].copy()
+            
+            scenario_df = self.create_rolling_features(scenario_df, config.feature_window_short)
+            scenario_df = self.create_rolling_features(scenario_df, config.feature_window_long)
+            scenario_df = self.create_spatial_derivatives(scenario_df)
+            scenario_df = self.create_temporal_derivatives(scenario_df)
+            scenario_df = self.create_advanced_features(scenario_df)
+            
+            scenario_dfs.append(scenario_df)
+        
+        result = pd.concat(scenario_dfs, ignore_index=True)
+        result = result.fillna(0)
+        
+        print(f"✅ Feature engineering complete. Shape: {result.shape}")
+        
+        return result
+    
+    def get_feature_columns(self, df: pd.DataFrame) -> list:
+        """Get list of feature column names (excluding metadata and target)"""
+        exclude_cols = [
+            'scenario_id', 'sim_time', 'step', 'flow_total', 'onramp_flow', 'speed_factor_mean',
+            'has_incident', 'incident_position', 'incident_active'
+        ]
+        
+        feature_cols = [col for col in df.columns if col not in exclude_cols]
+        
+        return feature_cols
+
+
+class AIDModel:
+    """Random Forest model for Automatic Incident Detection with advanced diagnostics"""
+    
+    def __init__(self):
+        self.model = None
+        self.feature_engineer = FeatureEngineer()
+        self.feature_columns = None
+        self.best_params = None
+        self.training_time = None
+        self.cv_results = None
+        self.train_score = None
+        self.test_score = None
+    
+    def prepare_data(self, df: pd.DataFrame, engineer_features: bool = True):
+        """Prepare data for training/testing"""
+        if engineer_features:
+            df = self.feature_engineer.engineer_features(df)
+        
+        if self.feature_columns is None:
+            self.feature_columns = self.feature_engineer.get_feature_columns(df)
+        
+        X = df[self.feature_columns]
+        y = df['incident_active']
+        
+        return X, y
+    
+    def train(self, train_df: pd.DataFrame, val_df: pd.DataFrame, refine_with_grid: bool = False):
+        """Train Random Forest with hyperparameter tuning"""
+        print("\n" + "="*60)
+        print("STARTING MODEL TRAINING")
+        print("="*60 + "\n")
+        
+        # Prepare data (feature engineering still happens in Pandas)
+        print("📊 Preparing training data...")
+        X_train_df, y_train_df = self.prepare_data(train_df, engineer_features=True)
+        X_val_df, y_val_df = self.prepare_data(val_df, engineer_features=True)
+
+        # Convert to NumPy float32 before .fit() to save RAM
+        print("Converting to Numpy float32")
+        X_train = X_train_df.to_numpy(dtype=np.float32, copy=False)
+        y_train = y_train_df.to_numpy(copy=False)
+        X_val = X_val_df.to_numpy(dtype=np.float32, copy=False)
+        y_val = y_val_df.to_numpy(copy=False)
+
+        print(f"  Total samples: {len(X_train):,} ({y_train.sum():,} incidents)")
+        
+        # 2. SUBSAMPLE SCENARIOS for hyperparameter tuning
+        print("\n📉 Subsampling scenarios for hyperparameter tuning...")
+        np.random.seed(config.random_state)
+        unique_scenarios = train_df['scenario_id'].unique()
+        hp_scenario_count = min(int(0.02 * len(unique_scenarios)), 600) # Use 2% of scenarios or 600, whichever comes first. This is the HP tuning target
+        
+        hp_scenario_subset = np.random.choice(
+            unique_scenarios, 
+            size=hp_scenario_count, 
+            replace=False
+        )
+        
+        # Filter raw df and prepare the subset
+        hp_df = train_df[train_df['scenario_id'].isin(hp_scenario_subset)]
+        X_hp_df, y_hp_df = self.prepare_data(hp_df, engineer_features=True)
+        X_hp = X_hp_df.to_numpy(dtype=np.float32, copy=False)
+        y_hp = y_hp_df.to_numpy(copy=False)
+
+        print(f"  ⚡ Tuning on {hp_scenario_count} scenarios ({len(X_hp):,} rows)")
+
+        # 3. Hyperparameter tuning (Broad Search)
+        print(f"\n🔍 PHASE 1: RandomizedSearchCV")
+        
+        # Set n_jobs=1 in the base estimator to avoid nested parallelism
+        rf_base = RandomForestClassifier(random_state=config.random_state, n_jobs=1)
+        
+        random_search = RandomizedSearchCV(
+            rf_base,
+            config.rf_param_distributions,
+            n_iter=config.n_iter_search,
+            cv=config.cv_folds,
+            scoring='f1',
+            n_jobs=20,
+            pre_dispatch=30,
+            verbose=3,
+            random_state=config.random_state,
+            error_score='raise'
+        )
+        
+        start_time = time.time()
+        random_search.fit(X_hp, y_hp) # Search on subset
+        tuning_time = time.time() - start_time
+        
+        # 4. FINAL FIT on FULL data
+        print(f"\n🏆 PHASE 2: Training final model on ALL {len(X_train):,} rows...")
+        final_fit_start = time.time()
+        
+        self.model = RandomForestClassifier(
+            **random_search.best_params_,
+            random_state=config.random_state,
+            n_jobs=20
+        )
+        self.model.fit(X_train, y_train)
+        
+        final_fit_time = time.time() - final_fit_start
+        self.training_time = tuning_time + final_fit_time # Total time calculation
+        self.best_params = random_search.best_params_
+        self.cv_results = random_search.cv_results_
+        
+        # Train score for diagnostics
+        self.train_score = f1_score(y_train, self.model.predict(X_train))
+        
+        print(f"\n✅ TRAINING COMPLETE")
+        print(f"  Tuning time: {tuning_time/60:.1f}m | Final fit time: {final_fit_time/60:.1f}m")
+        print(f"  Best CV F1 score: {random_search.best_score_:.4f}")
+        print(f"\n📋 Best hyperparameters from random search:")
+        for param, value in self.best_params.items():
+            print(f"  {param}: {value}")
+        
+        if refine_with_grid:
+            print(f"\n{'='*60}")
+            print(f"🔍 PHASE 2: GridSearchCV (Fine-tuning)")
+            print(f"{'='*60}")
+            print(f"  Refining around best parameters found...\n")
+            
+            refined_grid = self._create_refined_grid(self.best_params)
+            
+            grid_total_fits = 1
+            for v in refined_grid.values():
+                grid_total_fits *= len(v)
+            grid_total_fits *= config.cv_folds
+            
+            print(f"  Total grid fits: {grid_total_fits}")
+            print(f"  Estimated time: 20-60 minutes\n")
+            
+            from sklearn.model_selection import GridSearchCV
+            
+            grid_search = GridSearchCV(
+                rf_base,
+                refined_grid,
+                cv=config.cv_folds,
+                scoring='f1',
+                n_jobs=20,
+                pre_dispatch=30,
+                verbose=3
+            )
+            
+            grid_start = time.time()
+            grid_search.fit(X_train, y_train)
+            grid_time = time.time() - grid_start
+            
+            self.model = grid_search.best_estimator_
+            self.best_params = grid_search.best_params_
+            self.cv_results = grid_search.cv_results_
+            self.training_time = tuning_time + grid_time
+            
+            print(f"\n{'='*60}")
+            print(f"✅ PHASE 2 COMPLETE")
+            print(f"{'='*60}")
+            print(f"  Time: {grid_time/60:.1f} minutes")
+            print(f"  Improvement: {grid_search.best_score_ - random_search.best_score_:.4f}")
+            print(f"\n📋 Final refined hyperparameters:")
+            for param, value in self.best_params.items():
+                print(f"  {param}: {value}")
+        else:
+            self.training_time = tuning_time + final_fit_time
+        
+        # Calculate train score for diagnostics
+        y_train_pred = self.model.predict(X_train)
+        self.train_score = f1_score(y_train, y_train_pred)
+        
+        print(f"\n{'='*60}")
+        print(f"✅ TRAINING COMPLETE")
+        print(f"{'='*60}")
+        print(f"  Total time: {self.training_time/60:.1f} minutes ({self.training_time/3600:.2f} hours)")
+        
+        # Validation performance
+        print(f"\n{'='*60}")
+        print(f"📊 VALIDATION SET PERFORMANCE")
+        print(f"{'='*60}")
+        y_val_pred = self.model.predict(X_val)
+        val_accuracy = accuracy_score(y_val, y_val_pred)
+        val_precision = precision_score(y_val, y_val_pred, zero_division=0)
+        val_recall = recall_score(y_val, y_val_pred, zero_division=0)
+        val_f1 = f1_score(y_val, y_val_pred, zero_division=0)
+        
+        print(f"  Accuracy:  {val_accuracy:.4f}")
+        print(f"  Precision: {val_precision:.4f}")
+        print(f"  Recall:    {val_recall:.4f}")
+        print(f"  F1-score:  {val_f1:.4f}")
+        print(f"  (Validation is used during training for model selection)")
+    
+    def _create_refined_grid(self, best_params: dict) -> dict:
+        """Create a narrow grid around best parameters for refinement"""
+        refined_grid = {}
+        
+        n_est = best_params['n_estimators']
+        refined_grid['n_estimators'] = [max(50, n_est-50), n_est, min(300, n_est+50)]
+        
+        if best_params['max_depth'] is not None:
+            max_d = best_params['max_depth']
+            refined_grid['max_depth'] = [max(5, max_d-5), max_d, max_d+5, None]
+        else:
+            refined_grid['max_depth'] = [25, 30, None]
+        
+        min_split = best_params['min_samples_split']
+        refined_grid['min_samples_split'] = [max(2, min_split-2), min_split, min_split+2]
+        
+        min_leaf = best_params['min_samples_leaf']
+        refined_grid['min_samples_leaf'] = [max(1, min_leaf-1), min_leaf, min_leaf+1]
+        
+        refined_grid['max_features'] = [best_params['max_features']]
+        refined_grid['class_weight'] = [best_params['class_weight']]
+        
+        return refined_grid
+    
+    def run_advanced_diagnostics(self, train_df: pd.DataFrame, test_df: pd.DataFrame):
+        """
+        Run comprehensive diagnostics after training
+        Includes: Learning curves, validation curves, overfitting analysis, hyperparameter impact
+        """
+        print("\n" + "="*60)
+        print("🔬 RUNNING ADVANCED DIAGNOSTICS")
+        print("="*60)
+        
+        # USE A REPRESENTATIVE SUBSET FOR DIAGNOSTICS (to prevent freezing)
+        print("📉 Preparing diagnostic subset...")
+        diag_scenarios = train_df['scenario_id'].unique()[:int(len(train_df['scenario_id'].unique())*0.15)]
+        diag_df = train_df[train_df['scenario_id'].isin(diag_scenarios)]
+        
+        X_diag_df, y_diag_df = self.prepare_data(diag_df, engineer_features=True)
+        X_diag = X_diag_df.to_numpy(dtype=np.float32, copy=False)
+        y_diag = y_diag_df.to_numpy(copy=False)
+        
+        # Suppress warnings for clean output
+        warnings.filterwarnings('ignore')
+        
+        # =====================================================================
+        # 1. LEARNING CURVE
+        # =====================================================================
+        print("\n📈 Generating learning curve...")
+        
+        train_sizes = np.linspace(0.1, 1.0, 10)
+        train_sizes_abs, train_scores, val_scores = learning_curve(
+            self.model, X_diag, y_diag,
+            train_sizes=train_sizes,
+            cv=config.cv_folds,
+            scoring='f1',
+            n_jobs=10,
+            verbose=0
+        )
+        
+        train_scores_mean = np.mean(train_scores, axis=1)
+        train_scores_std = np.std(train_scores, axis=1)
+        val_scores_mean = np.mean(val_scores, axis=1)
+        val_scores_std = np.std(val_scores, axis=1)
+        
+        # Plot learning curve
+        plt.figure(figsize=(10, 6))
+        plt.fill_between(train_sizes_abs, 
+                        train_scores_mean - train_scores_std,
+                        train_scores_mean + train_scores_std, 
+                        alpha=0.1, color='blue')
+        plt.fill_between(train_sizes_abs, 
+                        val_scores_mean - val_scores_std,
+                        val_scores_mean + val_scores_std, 
+                        alpha=0.1, color='orange')
+        plt.plot(train_sizes_abs, train_scores_mean, 'o-', color='blue', label='Training score')
+        plt.plot(train_sizes_abs, val_scores_mean, 'o-', color='orange', label='Cross-validation score')
+        plt.xlabel('Training Examples')
+        plt.ylabel('F1 Score')
+        plt.title('Learning Curve')
+        plt.legend(loc='best')
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        
+        learning_curve_path = config.results_dir / "learning_curve.png"
+        plt.savefig(learning_curve_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  ✅ Learning curve saved to {learning_curve_path}")
+        
+        # =====================================================================
+        # 2. VALIDATION CURVE (max_depth)
+        # =====================================================================
+        print("\n📊 Generating validation curve for max_depth...")
+        
+        param_range = [5, 10, 15, 20, 25, 30, None]
+        train_scores, val_scores = validation_curve(
+            RandomForestClassifier(
+                n_estimators=self.best_params['n_estimators'],
+                min_samples_split=self.best_params['min_samples_split'],
+                min_samples_leaf=self.best_params['min_samples_leaf'],
+                max_features=self.best_params['max_features'],
+                class_weight=self.best_params['class_weight'],
+                random_state=config.random_state,
+                n_jobs=1 # Critical
+            ),
+            X_diag, y_diag,
+            param_name='max_depth',
+            param_range=param_range,
+            cv=config.cv_folds,
+            scoring='f1',
+            n_jobs=10,
+            verbose=0
+        )
+        
+        train_scores_mean = np.mean(train_scores, axis=1)
+        train_scores_std = np.std(train_scores, axis=1)
+        val_scores_mean = np.mean(val_scores, axis=1)
+        val_scores_std = np.std(val_scores, axis=1)
+        
+        # Plot validation curve
+        plt.figure(figsize=(10, 6))
+        param_range_str = [str(p) for p in param_range]
+        x_pos = np.arange(len(param_range))
+        
+        plt.plot(x_pos, train_scores_mean, 'o-', color='blue', label='Training score')
+        plt.plot(x_pos, val_scores_mean, 'o-', color='orange', label='Cross-validation score')
+        plt.fill_between(x_pos,
+                        train_scores_mean - train_scores_std,
+                        train_scores_mean + train_scores_std,
+                        alpha=0.1, color='blue')
+        plt.fill_between(x_pos,
+                        val_scores_mean - val_scores_std,
+                        val_scores_mean + val_scores_std,
+                        alpha=0.1, color='orange')
+        plt.xticks(x_pos, param_range_str)
+        plt.xlabel('max_depth')
+        plt.ylabel('F1 Score')
+        plt.title('Validation Curve (max_depth)')
+        plt.legend(loc='best')
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        
+        validation_curve_path = config.results_dir / "validation_curve_max_depth.png"
+        plt.savefig(validation_curve_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  ✅ Validation curve saved to {validation_curve_path}")
+        
+        # =====================================================================
+        # 3. FEATURE IMPORTANCE
+        # =====================================================================
+        print("\n🎯 Generating feature importance chart...")
+        
+        feature_importance = pd.DataFrame({
+            'feature': self.feature_columns,
+            'importance': self.model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        
+        # Plot top 30 features
+        plt.figure(figsize=(12, 10))
+        top_30 = feature_importance.head(30)
+        plt.barh(range(len(top_30)), top_30['importance'], color='steelblue')
+        plt.yticks(range(len(top_30)), top_30['feature'], fontsize=9)
+        plt.xlabel('Importance')
+        plt.title('Top 30 Feature Importances')
+        plt.gca().invert_yaxis()
+        plt.tight_layout()
+        
+        feature_importance_path = config.results_dir / "feature_importance_detailed.png"
+        plt.savefig(feature_importance_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"  ✅ Feature importance saved to {feature_importance_path}")
+        
+        # =====================================================================
+        # 4. HYPERPARAMETER IMPACT ANALYSIS
+        # =====================================================================
+        print("\n🔍 Analyzing hyperparameter impact...")
+        
+        cv_results_df = pd.DataFrame(self.cv_results)
+        
+        # Analyze each hyperparameter's impact
+        param_impact = {}
+        for param in ['n_estimators', 'max_depth', 'min_samples_split', 'min_samples_leaf', 'max_features', 'class_weight']:
+            param_col = f'param_{param}'
+            if param_col in cv_results_df.columns:
+                grouped = cv_results_df.groupby(param_col)['mean_test_score'].agg(['mean', 'std', 'count'])
+                score_range = grouped['mean'].max() - grouped['mean'].min()
+                param_impact[param] = {
+                    'score_range': score_range,
+                    'avg_std': grouped['std'].mean(),
+                    'best_value': grouped['mean'].idxmax()
+                }
+        
+        # Sort by impact
+        param_impact_sorted = sorted(param_impact.items(), key=lambda x: x[1]['score_range'], reverse=True)
+        
+        # =====================================================================
+        # 5. GENERALIZATION GAP
+        # =====================================================================
+        generalization_gap = self.train_score - self.test_score
+        
+        # =====================================================================
+        # FINAL SUMMARY (High-level only)
+        # =====================================================================
+        print("\n" + "="*60)
+        print("📋 DIAGNOSTIC SUMMARY")
+        print("="*60)
+        
+        print(f"\n🎯 OVERFITTING ANALYSIS:")
+        print(f"  Train F1 Score: {self.train_score:.4f}")
+        print(f"  Test F1 Score:  {self.test_score:.4f}")
+        print(f"  Generalization Gap: {generalization_gap:.4f}")
+        
+        if generalization_gap < 0.02:
+            print(f"  ✅ EXCELLENT - Model generalizes very well")
+        elif generalization_gap < 0.05:
+            print(f"  ✅ GOOD - Acceptable generalization")
+        elif generalization_gap < 0.10:
+            print(f"  ⚠️  MODERATE - Some overfitting detected")
+        else:
+            print(f"  ❌ HIGH - Significant overfitting! Consider regularization")
+        
+        print(f"\n🔧 HYPERPARAMETER IMPACT (Score Range):")
+        for param, impact in param_impact_sorted[:5]:
+            print(f"  {param:20s}: {impact['score_range']:.4f} (best: {impact['best_value']})")
+        
+        print(f"\n💡 OPTIMIZATION RECOMMENDATIONS:")
+        
+        # Low-impact parameters
+        low_impact_params = [p for p, i in param_impact_sorted if i['score_range'] < 0.01]
+        if low_impact_params:
+            print(f"  • Consider fixing these parameters (negligible impact):")
+            for param in low_impact_params:
+                best_val = param_impact[param]['best_value']
+                print(f"    - {param} = {best_val}")
+        else:
+            print(f"  • All hyperparameters have meaningful impact")
+        
+        # Learning curve analysis
+        final_train_score = train_scores_mean[-1]
+        final_val_score = val_scores_mean[-1]
+        if final_train_score - final_val_score > 0.05:
+            print(f"  • More training data may help (learning curves haven't converged)")
+        else:
+            print(f"  • Training data amount appears sufficient")
+        
+        # Feature analysis
+        top_10_importance_sum = feature_importance.head(10)['importance'].sum()
+        print(f"  • Top 10 features account for {top_10_importance_sum*100:.1f}% of importance")
+        
+        low_importance_features = feature_importance[feature_importance['importance'] < 0.001]
+        if len(low_importance_features) > 0:
+            print(f"  • Consider removing {len(low_importance_features)} low-importance features (< 0.001)")
+        
+        print("\n" + "="*60)
+        print("✅ DIAGNOSTICS COMPLETE")
+        print("="*60)
+        
+        # Save diagnostic report
+        diagnostic_report = {
+            'generalization_gap': float(generalization_gap),
+            'train_f1': float(self.train_score),
+            'test_f1': float(self.test_score),
+            'hyperparameter_impact': {
+                param: {
+                    'score_range': float(impact['score_range']),
+                    'best_value': str(impact['best_value'])
+                }
+                for param, impact in param_impact_sorted
+            },
+            'low_impact_parameters': low_impact_params,
+            'top_10_importance_sum': float(top_10_importance_sum),
+            'low_importance_feature_count': len(low_importance_features),
+            'recommendations': {
+                'overfitting_status': 'excellent' if generalization_gap < 0.02 else 
+                                     'good' if generalization_gap < 0.05 else
+                                     'moderate' if generalization_gap < 0.10 else 'high',
+                'need_more_data': bool(final_train_score - final_val_score > 0.05),
+                'removable_features': low_importance_features['feature'].tolist()
+            }
+        }
+        
+        diagnostic_file = config.results_dir / "diagnostic_report.json"
+        with open(diagnostic_file, 'w') as f:
+            json.dump(diagnostic_report, f, indent=2)
+        print(f"\n💾 Full diagnostic report saved to {diagnostic_file}")
+        
+        # Restore warnings
+        warnings.filterwarnings('default')
+    
+    def evaluate(self, test_df: pd.DataFrame, save_plots: bool = True):
+        """Comprehensive evaluation on test set"""
+        print("\n" + "="*60)
+        print("📊 FINAL TEST SET EVALUATION")
+        print("="*60)
+        print("(This is unseen data - the true measure of model performance)\n")
+        
+        X_test, y_test = self.prepare_data(test_df, engineer_features=True)
+        
+        print(f"Test set: {len(X_test):,} samples ({y_test.sum():,} incidents)\n")
+        
+        y_pred = self.model.predict(X_test.values)
+        y_pred_proba = self.model.predict_proba(X_test)[:, 1]
+        
+        accuracy = accuracy_score(y_test, y_pred)
+        precision = precision_score(y_test, y_pred, zero_division=0)
+        recall = recall_score(y_test, y_pred, zero_division=0)
+        f1 = f1_score(y_test, y_pred, zero_division=0)
+        
+        try:
+            auc = roc_auc_score(y_test, y_pred_proba)
+        except:
+            auc = None
+        
+        cm = confusion_matrix(y_test, y_pred)
+        tn, fp, fn, tp = cm.ravel()
+        
+        print("="*60)
+        print("🎯 FINAL MODEL PERFORMANCE (TEST SET)")
+        print("="*60)
+        print(f"Accuracy:  {accuracy:.4f}  ← Overall correctness")
+        print(f"Precision: {precision:.4f}  ← When we predict incident, how often correct?")
+        print(f"Recall:    {recall:.4f}  ← What % of real incidents do we catch?")
+        print(f"F1-score:  {f1:.4f}  ← Balanced precision/recall metric")
+        if auc:
+            print(f"ROC AUC:   {auc:.4f}  ← Overall discrimination ability")
+
+
+        print(f"\n{'='*60}")
+        print("CONFUSION MATRIX")
+        print("="*60)
+        print(f"True Negatives:  {tn:,}  ← Correctly identified NO incident")
+        print(f"False Positives: {fp:,}  ← False alarms (said incident, but wasn't)")
+        print(f"False Negatives: {fn:,}  ← Missed incidents (was incident, but didn't detect)")
+        print(f"True Positives:  {tp:,}  ← Correctly detected incidents")
+        
+        # Add interpretation
+        detection_rate = (tp / (tp + fn)) * 100 if (tp + fn) > 0 else 0
+        false_alarm_rate = (fp / (fp + tn)) * 100 if (fp + tn) > 0 else 0
+        print(f"\n📈 Key Insights:")
+        print(f"  Detection rate: {detection_rate:.1f}% (catching {detection_rate:.1f}% of all incidents)")
+        print(f"  False alarm rate: {false_alarm_rate:.1f}% (false alarms in {false_alarm_rate:.1f}% of normal traffic)")
+        
+        print(f"\n{'='*60}")
+        print("DETAILED CLASSIFICATION REPORT")
+        print("="*60)
+        print(classification_report(y_test, y_pred, 
+                                   target_names=['No Incident', 'Incident']))
+        
+        # Feature importance
+        print(f"\n{'='*60}")
+        print("TOP 20 MOST IMPORTANT FEATURES")
+        print("="*60)
+        feature_importance = pd.DataFrame({
+            'feature': self.feature_columns,
+            'importance': self.model.feature_importances_
+        }).sort_values('importance', ascending=False)
+        
+        for idx, row in feature_importance.head(20).iterrows():
+            print(f"{row['feature']:40s} {row['importance']:.4f}")
+        
+        # Save results
+        results = {
+            'accuracy': float(accuracy),
+            'precision': float(precision),
+            'recall': float(recall),
+            'f1_score': float(f1),
+            'roc_auc': float(auc) if auc else None,
+            'confusion_matrix': {
+                'tn': int(tn), 'fp': int(fp), 'fn': int(fn), 'tp': int(tp)
+            },
+            'training_time_minutes': float(self.training_time / 60),
+            'test_samples': int(len(X_test)),
+            'incident_samples': int(y_test.sum())
+        }
+        
+        results_file = config.results_dir / "metrics.json"
+        with open(results_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"\n💾 Metrics saved to {results_file}")
+        
+        # Save configuration summary
+        config_summary = {
+            'simulation': {
+                'flow_range': f"{config.flow_min}-{config.flow_max} veh/h (step {config.flow_step})",
+                'onramp_flow_range': f"{config.onramp_flow_min}-{config.onramp_flow_max} veh/h (step {config.onramp_flow_step})",
+                'speed_factor_range': f"{config.speed_factor_min}-{config.speed_factor_max}",
+                'incident_positions': config.incident_positions,
+                'total_scenarios': config.total_scenarios,
+                'detector_zones': f"{len(config.detector_edges)} detectors at {config.detector_positions}m"
+            },
+            'model': {
+                'algorithm': 'RandomForestClassifier',
+                'search_method': 'RandomizedSearchCV',
+                'n_iter_search': config.n_iter_search,
+                'cv_folds': config.cv_folds,
+                'best_params': self.best_params,
+                'training_time_minutes': float(self.training_time / 60)
+            },
+            'data': {
+                'train_samples': int(len(X_test) * (config.train_ratio / config.test_ratio)),
+                'val_samples': int(len(X_test) * (config.val_ratio / config.test_ratio)),
+                'test_samples': int(len(X_test)),
+                'n_features': len(self.feature_columns),
+                'feature_windows': f"{config.feature_window_short}s and {config.feature_window_long}s"
+            },
+            'performance': results
+        }
+        
+        config_file = config.results_dir / "run_configuration.json"
+        with open(config_file, 'w') as f:
+            json.dump(config_summary, f, indent=2)
+        print(f"💾 Configuration saved to {config_file}")
+        
+        # Save plots
+        if save_plots:
+            self._plot_confusion_matrix(cm)
+            self._plot_feature_importance(feature_importance.head(20))
+            if auc:
+                self._plot_roc_curve(y_test, y_pred_proba)
+
+        self.test_score = f1_score(y_test, y_pred)
+        return results
+    
+    def _plot_confusion_matrix(self, cm):
+        """Plot and save confusion matrix"""
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                   xticklabels=['No Incident', 'Incident'],
+                   yticklabels=['No Incident', 'Incident'])
+        plt.title('Confusion Matrix')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        plt.tight_layout()
+        
+        save_path = config.results_dir / "confusion_matrix.png"
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"💾 Confusion matrix saved to {save_path}")
+    
+    def _plot_feature_importance(self, feature_df):
+        """Plot and save feature importance"""
+        plt.figure(figsize=(10, 8))
+        plt.barh(range(len(feature_df)), feature_df['importance'])
+        plt.yticks(range(len(feature_df)), feature_df['feature'])
+        plt.xlabel('Importance')
+        plt.title('Top 20 Feature Importances')
+        plt.tight_layout()
+        
+        save_path = config.results_dir / "feature_importance.png"
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"💾 Feature importance saved to {save_path}")
+    
+    def _plot_roc_curve(self, y_test, y_pred_proba):
+        """Plot and save ROC curve"""
+        fpr, tpr, thresholds = roc_curve(y_test, y_pred_proba)
+        auc = roc_auc_score(y_test, y_pred_proba)
+        
+        plt.figure(figsize=(8, 6))
+        plt.plot(fpr, tpr, label=f'ROC Curve (AUC = {auc:.3f})')
+        plt.plot([0, 1], [0, 1], 'k--', label='Random Classifier')
+        plt.xlabel('False Positive Rate')
+        plt.ylabel('True Positive Rate')
+        plt.title('ROC Curve')
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        
+        save_path = config.results_dir / "roc_curve.png"
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"💾 ROC curve saved to {save_path}")
+    
+    def save_model(self):
+        """Save trained model and metadata"""
+        model_file = config.models_dir / "rf_model.pkl"
+        params_file = config.models_dir / "best_params.json"
+        features_file = config.models_dir / "feature_columns.json"
+        
+        # Save model
+        joblib.dump(self.model, model_file, compress=3)
+        print(f"💾 Model saved to {model_file}")
+        
+        # Save best parameters
+        with open(params_file, 'w') as f:
+            json.dump(self.best_params, f, indent=2)
+        print(f"💾 Best parameters saved to {params_file}")
+        
+        # Save feature columns
+        with open(features_file, 'w') as f:
+            json.dump(self.feature_columns, f, indent=2)
+        print(f"💾 Feature columns saved to {features_file}")
+    
+    def load_model(self):
+        """Load trained model and metadata"""
+        model_file = config.models_dir / "rf_model.pkl"
+        params_file = config.models_dir / "best_params.json"
+        features_file = config.models_dir / "feature_columns.json"
+        
+        with open(model_file, 'rb') as f:
+            self.model = joblib.load(model_file)
+        
+        with open(params_file, 'r') as f:
+            self.best_params = json.load(f)
+        
+        with open(features_file, 'r') as f:
+            self.feature_columns = json.load(f)
+        
+        print("✅ Model loaded successfully")
+
+
+def train_and_evaluate(use_grid_refinement: bool = False, run_diagnostics: bool = True):
+    """
+    Main training and evaluation pipeline
+    
+    Args:
+        use_grid_refinement: If True, refine RandomSearch results with GridSearch (slower)
+    """
+    print("\n" + "="*60)
+    print("AUTOMATIC INCIDENT DETECTION - MODEL TRAINING")
+    print("="*60 + "\n")
+    
+    # Load data
+    print("📂 Loading data from HDF5...")
+    train_df = pd.read_hdf(config.train_h5, key='data')
+    val_df = pd.read_hdf(config.val_h5, key='data')
+    test_df = pd.read_hdf(config.test_h5, key='data')
+    
+    print(f"  Train: {len(train_df):,} samples")
+    print(f"  Val:   {len(val_df):,} samples")
+    print(f"  Test:  {len(test_df):,} samples")
+    
+    # Initialize model
+    model = AIDModel()
+    
+    # Train
+    model.train(train_df, val_df, refine_with_grid=use_grid_refinement)
+    
+    # Save model
+    print(f"\n{'='*60}")
+    print("SAVING MODEL")
+    print("="*60)
+    model.save_model()
+
+    # Evaluate
+    model.evaluate(test_df, save_plots=True)
+
+    # Run diagnostics
+    if run_diagnostics:
+        model.run_advanced_diagnostics(train_df, test_df)
+    
+        
+    print(f"\n{'='*60}")
+    print("✅ TRAINING AND EVALUATION COMPLETE!")
+    print("="*60)
+    print(f"\n💡 Next steps:")
+    print(f"  1. Check diagnostic_report.json for optimization recommendations")
+    print(f"  2. Review learning_curve.png and validation_curve_max_depth.png")
+    print(f"  3. Run 'python analysis.py' to analyze failures")
+    print(f"  4. Run 'python demo.py' to see live predictions")
+    print(f"  5. To refine further, run with grid search:")
+    print(f"     train_and_evaluate(use_grid_refinement=True)")
+    
+
+
+if __name__ == "__main__":
+    print("\n🔍 INSPECTING ENGINEERED FEATURES...")
+    model_inspector = AIDModel()
+    # Load a tiny slice of data
+    sample_df = pd.read_hdf(config.train_h5, key='data', stop=1000)
+    # Trigger engineering
+    X, y = model_inspector.prepare_data(sample_df, engineer_features=True)
+    
+    print(f"✅ Engineering successful!")
+    print(f"🔢 Total features created: {len(X.columns)}")
+    print("📋 Feature List:")
+    for col in X.columns.tolist():
+        print(f"  - {col}")
+    print("-" * 30 + "\n")
+    # Set to True to refine with GridSearchCV after RandomSearchCV
+    # This takes 2-3x longer but can improve F1 by 1-3%
+    train_and_evaluate(use_grid_refinement=False)
