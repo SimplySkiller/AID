@@ -1,0 +1,788 @@
+"""
+Test a pre-trained model on a new dataset
+No training required - just load model and evaluate on test data
+Includes comprehensive metrics and visualizations
+"""
+
+import pandas as pd
+import numpy as np
+import pickle
+import json
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
+from sklearn.metrics import (
+    classification_report, confusion_matrix, accuracy_score,
+    precision_score, recall_score, f1_score, roc_auc_score,
+    roc_curve
+)
+
+import config
+from model import FeatureEngineer
+
+
+def load_pretrained_model(model_path: Path, features_path: Path):
+    """
+    Load a pre-trained model and its feature columns
+    
+    Args:
+        model_path: Path to pickled model file
+        features_path: Path to feature columns JSON
+        
+    Returns:
+        model, feature_columns
+    """
+    print("📦 Loading pre-trained model...")
+    
+    with open(model_path, 'rb') as f:
+        model = pickle.load(f)
+    
+    with open(features_path, 'r') as f:
+        feature_columns = json.load(f)
+    
+    print(f"  ✅ Model loaded: {type(model).__name__}")
+    print(f"  ✅ Features loaded: {len(feature_columns)} features")
+    
+    return model, feature_columns
+
+
+def evaluate_model(model, X_test, y_test, dataset_name="Test"):
+    """
+    Comprehensive evaluation of model performance
+    
+    Args:
+        model: Trained model
+        X_test: Test features
+        y_test: Test labels
+        dataset_name: Name of dataset for reporting
+        
+    Returns:
+        Dictionary with all metrics
+    """
+    print(f"\n{'='*60}")
+    print(f"📊 EVALUATING MODEL ON {dataset_name.upper()} SET")
+    print(f"{'='*60}")
+    
+    # Predictions
+    y_pred = model.predict(X_test.values)
+    y_pred_proba = model.predict_proba(X_test.values)[:, 1]
+    
+    # Basic metrics
+    accuracy = accuracy_score(y_test, y_pred)
+    precision = precision_score(y_test, y_pred, zero_division=0)
+    recall = recall_score(y_test, y_pred, zero_division=0)
+    f1 = f1_score(y_test, y_pred, zero_division=0)
+    
+    try:
+        auc = roc_auc_score(y_test, y_pred_proba)
+    except:
+        auc = None
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_test, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+    
+    # Additional rates
+    detection_rate = (tp / (tp + fn)) * 100 if (tp + fn) > 0 else 0  # Also called TPR (True Positive Rate)
+    false_alarm_rate = (fp / (fp + tn)) * 100 if (fp + tn) > 0 else 0  # FAR = FP / (FP + TN)
+    miss_rate = (fn / (tp + fn)) * 100 if (tp + fn) > 0 else 0  # Also called FNR (False Negative Rate)
+    specificity = (tn / (tn + fp)) * 100 if (tn + fp) > 0 else 0  # TNR (True Negative Rate)
+    
+    # Print results
+    print(f"\n🎯 PERFORMANCE METRICS:")
+    print(f"{'='*60}")
+    print(f"  Accuracy:  {accuracy:.4f} ({accuracy*100:.2f}%)")
+    print(f"  Precision: {precision:.4f} ({precision*100:.2f}%)")
+    print(f"  Recall:    {recall:.4f} ({recall*100:.2f}%)")
+    print(f"  F1-Score:  {f1:.4f}")
+    if auc:
+        print(f"  ROC AUC:   {auc:.4f}")
+    
+    print(f"\n📈 CONFUSION MATRIX:")
+    print(f"{'='*60}")
+    print(f"  True Negatives (TN):  {tn:,}")
+    print(f"  False Positives (FP): {fp:,}")
+    print(f"  False Negatives (FN): {fn:,}")
+    print(f"  True Positives (TP):  {tp:,}")
+    
+    print(f"\n📊 OPERATIONAL METRICS:")
+    print(f"{'='*60}")
+    print(f"  Detection Rate (TPR):     {detection_rate:.2f}%  ← Catching {detection_rate:.1f}% of incidents")
+    print(f"  False Alarm Rate (FAR):   {false_alarm_rate:.2f}%  ← {false_alarm_rate:.1f}% of normal traffic triggers alarm")
+    print(f"  Miss Rate (FNR):          {miss_rate:.2f}%  ← Missing {miss_rate:.1f}% of incidents")
+    print(f"  Specificity (TNR):        {specificity:.2f}%  ← Correctly identifying {specificity:.1f}% of normal traffic")
+    
+    print(f"\n📋 DETAILED CLASSIFICATION REPORT:")
+    print(f"{'='*60}")
+    print(classification_report(y_test, y_pred, target_names=['No Incident', 'Incident']))
+    
+    # Return metrics dictionary
+    metrics = {
+        'accuracy': float(accuracy),
+        'precision': float(precision),
+        'recall': float(recall),
+        'f1_score': float(f1),
+        'roc_auc': float(auc) if auc else None,
+        'confusion_matrix': {
+            'tn': int(tn),
+            'fp': int(fp),
+            'fn': int(fn),
+            'tp': int(tp)
+        },
+        'rates': {
+            'detection_rate_percent': float(detection_rate),
+            'false_alarm_rate_percent': float(false_alarm_rate),
+            'miss_rate_percent': float(miss_rate),
+            'specificity_percent': float(specificity)
+        },
+        'predictions': {
+            'y_pred': y_pred.tolist(),
+            'y_pred_proba': y_pred_proba.tolist()
+        }
+    }
+    
+    return metrics, y_pred, y_pred_proba
+
+
+def plot_far_vs_traffic_state(test_engineered: pd.DataFrame, y_test, y_pred, output_dir: Path):
+    """
+    Plot False Alarm Rate vs Traffic State (mainline flow with on-ramp flow as lines)
+    
+    Args:
+        test_engineered: Engineered test data
+        y_test: True labels
+        y_pred: Predicted labels
+        output_dir: Directory to save plots
+    """
+    print("\n📊 Generating FAR vs Traffic State plot...")
+    
+    # Add predictions to dataframe
+    analysis_df = test_engineered.copy()
+    analysis_df['y_true'] = y_test
+    analysis_df['y_pred'] = y_pred
+    
+    # Calculate FAR for each flow combination
+    # FAR = FP / (FP + TN) = False alarms among normal traffic
+    far_data = []
+    
+    for mainline in sorted(analysis_df['flow_total'].unique()):
+        for onramp in sorted(analysis_df['onramp_flow'].unique()):
+            # Get data for this traffic state
+            mask = ((analysis_df['flow_total'] == mainline) & 
+                   (analysis_df['onramp_flow'] == onramp) &
+                   (analysis_df['incident_active'] == 0))  # Only normal traffic
+            
+            if mask.sum() > 0:
+                subset = analysis_df[mask]
+                
+                # Calculate FAR
+                tn = ((subset['y_true'] == 0) & (subset['y_pred'] == 0)).sum()
+                fp = ((subset['y_true'] == 0) & (subset['y_pred'] == 1)).sum()
+                
+                far = (fp / (fp + tn) * 100) if (fp + tn) > 0 else 0
+                
+                far_data.append({
+                    'mainline_flow': mainline,
+                    'onramp_flow': onramp,
+                    'far_percent': far,
+                    'fp': fp,
+                    'tn': tn
+                })
+    
+    far_df = pd.DataFrame(far_data)
+    
+    # Plot: FAR vs Mainline Flow (with lines for each on-ramp flow)
+    plt.figure(figsize=(12, 7))
+    
+    for onramp in sorted(far_df['onramp_flow'].unique()):
+        subset = far_df[far_df['onramp_flow'] == onramp]
+        plt.plot(subset['mainline_flow'], subset['far_percent'], 
+                marker='o', linewidth=2, markersize=8, 
+                label=f'On-ramp: {onramp} veh/h')
+    
+    plt.xlabel('Mainline Flow (veh/h)', fontsize=12)
+    plt.ylabel('False Alarm Rate (%)', fontsize=12)
+    plt.title('False Alarm Rate vs Traffic State', fontsize=14, fontweight='bold')
+    plt.legend(title='On-ramp Flow', fontsize=10)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    
+    plot_path = output_dir / "far_vs_traffic_state.png"
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  ✅ FAR vs Traffic State saved to {plot_path}")
+    
+    return far_df
+
+
+def plot_far_heatmap(far_df: pd.DataFrame, output_dir: Path):
+    """
+    Plot FAR heatmap: mainline × on-ramp
+    
+    Args:
+        far_df: DataFrame with FAR data by flow combination
+        output_dir: Directory to save plots
+    """
+    print("\n📊 Generating FAR heatmap...")
+    
+    # Create pivot table
+    pivot = far_df.pivot(index='onramp_flow', columns='mainline_flow', values='far_percent')
+    
+    plt.figure(figsize=(12, 8))
+    sns.heatmap(pivot, annot=True, fmt='.1f', cmap='YlOrRd', 
+                cbar_kws={'label': 'False Alarm Rate (%)'})
+    plt.xlabel('Mainline Flow (veh/h)', fontsize=12)
+    plt.ylabel('On-ramp Flow (veh/h)', fontsize=12)
+    plt.title('False Alarm Rate Heatmap: Mainline × On-ramp Traffic', 
+              fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    plot_path = output_dir / "far_heatmap.png"
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  ✅ FAR heatmap saved to {plot_path}")
+
+def plot_detection_rate_vs_traffic(test_engineered, y_test, y_pred, output_dir):
+    """
+    Plot Detection Rate (Recall) vs Traffic State
+    Shows where the model is most successful at catching incidents.
+    """
+    print("\n📊 Generating Detection Rate vs Traffic State plot...")
+    
+    # 1. Prepare data
+    analysis_df = test_engineered.copy()
+    analysis_df['y_true'] = y_test
+    analysis_df['y_pred'] = y_pred
+    
+    dr_data = []
+    
+    # 2. Calculate Detection Rate (Recall) for each flow combination
+    for mainline in sorted(analysis_df['flow_total'].unique()):
+        for onramp in sorted(analysis_df['onramp_flow'].unique()):
+            # Filter for this traffic state AND ONLY real incidents
+            mask = ((analysis_df['flow_total'] == mainline) & 
+                    (analysis_df['onramp_flow'] == onramp) &
+                    (analysis_df['incident_active'] == 1))
+            
+            if mask.sum() > 0:
+                subset = analysis_df[mask]
+                
+                # Calculate True Positives and False Negatives
+                tp = ((subset['y_true'] == 1) & (subset['y_pred'] == 1)).sum()
+                fn = ((subset['y_true'] == 1) & (subset['y_pred'] == 0)).sum()
+                
+                # Detection Rate = Recall
+                dr = (tp / (tp + fn) * 100) if (tp + fn) > 0 else 0
+                
+                dr_data.append({
+                    'mainline_flow': mainline,
+                    'onramp_flow': onramp,
+                    'detection_rate_percent': dr,
+                    'tp': int(tp),
+                    'fn': int(fn)
+                })
+    
+    dr_df = pd.DataFrame(dr_data)
+    
+    if dr_df.empty:
+        print("  ⚠️  No incident data found in this set - skipping plot.")
+        return None
+
+    # 3. Create the Visualization
+    plt.figure(figsize=(12, 7))
+    
+    for onramp in sorted(dr_df['onramp_flow'].unique()):
+        subset = dr_df[dr_df['onramp_flow'] == onramp]
+        plt.plot(subset['mainline_flow'], subset['detection_rate_percent'], 
+                marker='s', linewidth=2, markersize=8, 
+                label=f'On-ramp: {onramp} veh/h')
+    
+    plt.xlabel('Mainline Flow (veh/h)', fontsize=12)
+    plt.ylabel('Detection Rate / Recall (%)', fontsize=12)
+    plt.title('Incident Detection Rate vs Traffic State', fontsize=14, fontweight='bold')
+    plt.legend(title='On-ramp Flow', fontsize=10)
+    plt.grid(alpha=0.3)
+    plt.ylim([-5, 105]) # Ensure 0-100% scale is clear
+    plt.tight_layout()
+    
+    # 4. Save
+    plot_path = output_dir / "detection_rate_vs_traffic_state.png"
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  ✅ Detection Rate plot saved to {plot_path}")
+    
+    return dr_df
+
+
+def analyze_threshold_impact(test_engineered: pd.DataFrame, y_test, y_pred_proba, output_dir: Path):
+    """
+    Analyze how different thresholds affect FAR
+    Critical for congestion-only datasets
+    
+    Args:
+        test_engineered: Engineered test data
+        y_test: True labels
+        y_pred_proba: Predicted probabilities
+        output_dir: Directory to save plots
+    """
+    print("\n📊 Analyzing threshold impact on FAR...")
+    
+    # Test different thresholds (include current threshold)
+    thresholds = np.arange(0.1, 0.95, 0.05)
+    # Make sure current threshold is included
+    if config.demo_confidence_threshold not in thresholds:
+        thresholds = np.sort(np.append(thresholds, config.demo_confidence_threshold))
+    
+    threshold_results = []
+    
+    for threshold in thresholds:
+        y_pred_thresh = (y_pred_proba >= threshold).astype(int)
+        
+        # Calculate metrics
+        tn = ((y_test == 0) & (y_pred_thresh == 0)).sum()
+        fp = ((y_test == 0) & (y_pred_thresh == 1)).sum()
+        fn = ((y_test == 1) & (y_pred_thresh == 0)).sum()
+        tp = ((y_test == 1) & (y_pred_thresh == 1)).sum()
+        
+        far = (fp / (fp + tn) * 100) if (fp + tn) > 0 else 0
+        specificity = (tn / (tn + fp) * 100) if (tn + fp) > 0 else 0
+        
+        # For datasets with incidents
+        if (tp + fn) > 0:
+            recall = (tp / (tp + fn) * 100)
+        else:
+            recall = np.nan
+        
+        threshold_results.append({
+            'threshold': threshold,
+            'far_percent': far,
+            'specificity_percent': specificity,
+            'recall_percent': recall,
+            'fp': fp,
+            'tn': tn
+        })
+    
+    results_df = pd.DataFrame(threshold_results)
+    
+    # Plot threshold impact
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle('Threshold Impact Analysis', fontsize=14, fontweight='bold')
+    
+    # Plot 1: FAR vs Threshold
+    ax1.plot(results_df['threshold'], results_df['far_percent'], 
+             'r-o', linewidth=2, markersize=6, label='FAR')
+    ax1.plot(results_df['threshold'], results_df['specificity_percent'], 
+             'g-s', linewidth=2, markersize=6, label='Specificity (TNR)')
+    ax1.axvline(x=config.demo_confidence_threshold, color='orange', 
+                linestyle='--', linewidth=2, label=f'Current Threshold ({config.demo_confidence_threshold})')
+    ax1.set_xlabel('Detection Threshold', fontsize=12)
+    ax1.set_ylabel('Rate (%)', fontsize=12)
+    ax1.set_title('False Alarm Rate vs Threshold', fontsize=12)
+    ax1.legend(fontsize=10)
+    ax1.grid(alpha=0.3)
+    ax1.set_ylim([0, 105])
+    
+    # Plot 2: Recommended threshold
+    # Find threshold that gives <10% FAR
+    target_far = 10.0
+    acceptable = results_df[results_df['far_percent'] <= target_far]
+    
+    if len(acceptable) > 0:
+        recommended_threshold = acceptable.iloc[0]['threshold']
+        recommended_far = acceptable.iloc[0]['far_percent']
+        
+        # Get current threshold FAR
+        current_threshold_row = results_df[results_df['threshold'].round(2) == round(config.demo_confidence_threshold, 2)]
+        if len(current_threshold_row) > 0:
+            current_far = current_threshold_row['far_percent'].iloc[0]
+        else:
+            # Fallback: find closest threshold
+            idx = (results_df['threshold'] - config.demo_confidence_threshold).abs().idxmin()
+            current_far = results_df.loc[idx, 'far_percent']
+        
+        ax2.bar(['Current\nThreshold', 'Recommended\nThreshold'], 
+                [current_far, recommended_far],
+                color=['red', 'green'], alpha=0.7)
+        ax2.set_ylabel('False Alarm Rate (%)', fontsize=12)
+        ax2.set_title(f'Threshold Comparison (Target: <{target_far}% FAR)', fontsize=12)
+        ax2.grid(alpha=0.3, axis='y')
+        
+        # Add values on bars
+        for i, v in enumerate([current_far, recommended_far]):
+            ax2.text(i, v + 2, f'{v:.1f}%', ha='center', fontweight='bold')
+        
+        # Add recommendation text
+        ax2.text(0.5, 0.95, f'Recommended: {recommended_threshold:.2f}\n(FAR: {recommended_far:.1f}%)', 
+                transform=ax2.transAxes, fontsize=11, verticalalignment='top', ha='center',
+                bbox=dict(boxstyle='round', facecolor='lightgreen', alpha=0.8))
+    else:
+        ax2.text(0.5, 0.5, 'No threshold achieves\n<10% FAR on this dataset', 
+                transform=ax2.transAxes, fontsize=12, ha='center', va='center',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        recommended_threshold = None
+        recommended_far = None
+    
+    plt.tight_layout()
+    plot_path = output_dir / "threshold_impact_analysis.png"
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  ✅ Threshold impact analysis saved to {plot_path}")
+    
+    # Print recommendations
+    print(f"\n🎯 Threshold Recommendations:")
+    print(f"  Current threshold: {config.demo_confidence_threshold}")
+    
+    # Get current FAR (handle floating point comparison)
+    current_threshold_row = results_df[results_df['threshold'].round(2) == round(config.demo_confidence_threshold, 2)]
+    if len(current_threshold_row) > 0:
+        current_far_val = current_threshold_row['far_percent'].iloc[0]
+    else:
+        idx = (results_df['threshold'] - config.demo_confidence_threshold).abs().idxmin()
+        current_far_val = results_df.loc[idx, 'far_percent']
+    
+    print(f"  Current FAR: {current_far_val:.2f}%")
+    
+    if recommended_threshold:
+        print(f"\n  💡 RECOMMENDED: Change threshold to {recommended_threshold:.2f}")
+        print(f"     This would reduce FAR to {recommended_far:.2f}%")
+        print(f"     Update config.py: demo_confidence_threshold = {recommended_threshold:.2f}")
+    else:
+        print(f"\n  ⚠️  WARNING: Even at threshold 0.90, FAR is still high")
+        print(f"     This suggests the model needs retraining with congestion data")
+    
+    # Save threshold analysis
+    threshold_csv = output_dir / "threshold_analysis.csv"
+    results_df.to_csv(threshold_csv, index=False)
+    print(f"  💾 Full threshold analysis saved to {threshold_csv}")
+    
+    return results_df, recommended_threshold
+def plot_confidence_distributions(test_engineered, y_test, y_pred_proba, output_dir):
+    """
+    Plot ML confidence distributions: congestion vs real incidents
+    Shows model separability - key thesis figure
+    
+    Args:
+        test_engineered: Engineered test data
+        y_pred_proba: Predicted probabilities
+        output_dir: Directory to save plots
+    """
+    print("\n📊 Generating confidence distribution plots...")
+    
+    # Add predictions to dataframe
+    analysis_df = test_engineered.copy()
+    analysis_df['y_true'] = y_test
+    analysis_df['pred_proba'] = y_pred_proba
+    
+    # Separate by true state
+    congestion_only = analysis_df[analysis_df['incident_active'] == 0]['pred_proba']
+    real_incidents = analysis_df[analysis_df['incident_active'] == 1]['pred_proba']
+    
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+    fig.suptitle('ML Confidence Distributions: Model Separability Analysis', 
+                 fontsize=14, fontweight='bold')
+    
+    # Plot 1: Overlapping histograms
+    ax1.hist(congestion_only, bins=50, alpha=0.6, label='Normal Traffic (Congestion)', 
+             color='blue', edgecolor='black', density=True)
+    ax1.hist(real_incidents, bins=50, alpha=0.6, label='Real Incidents', 
+             color='red', edgecolor='black', density=True)
+    ax1.axvline(x=config.demo_confidence_threshold, color='green', 
+                linestyle='--', linewidth=2, label=f'Threshold ({config.demo_confidence_threshold})')
+    ax1.set_xlabel('ML Confidence Score', fontsize=12)
+    ax1.set_ylabel('Density', fontsize=12)
+    ax1.set_title('Distribution Overlap', fontsize=12)
+    ax1.legend(fontsize=10)
+    ax1.grid(alpha=0.3, axis='y')
+    
+    # Plot 2: Box plots for statistical comparison
+    data_to_plot = [congestion_only, real_incidents]
+    bp = ax2.boxplot(data_to_plot, labels=['Normal Traffic', 'Real Incidents'], 
+                     patch_artist=True, showmeans=True, widths=0.6)
+    bp['boxes'][0].set_facecolor('blue')
+    bp['boxes'][1].set_facecolor('red')
+    for patch in bp['boxes']:
+        patch.set_alpha(0.6)
+    ax2.axhline(y=config.demo_confidence_threshold, color='green', 
+                linestyle='--', linewidth=2, label=f'Threshold ({config.demo_confidence_threshold})')
+    ax2.set_ylabel('ML Confidence Score', fontsize=12)
+    ax2.set_title('Statistical Comparison', fontsize=12)
+    ax2.legend(fontsize=10)
+    ax2.grid(alpha=0.3, axis='y')
+    
+    # Add separation metrics as text
+    mean_congestion = congestion_only.mean()
+    mean_incidents = real_incidents.mean()
+    separation = mean_incidents - mean_congestion
+    
+    overlap_pct = ((congestion_only > config.demo_confidence_threshold).sum() / len(congestion_only) * 100)
+    
+    textstr = f'Separation Metrics:\n'
+    textstr += f'Mean (Normal): {mean_congestion:.3f}\n'
+    textstr += f'Mean (Incident): {mean_incidents:.3f}\n'
+    textstr += f'Separation: {separation:.3f}\n'
+    textstr += f'Overlap: {overlap_pct:.1f}% above threshold'
+    
+    ax1.text(0.02, 0.98, textstr, transform=ax1.transAxes, fontsize=10,
+             verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
+    plt.tight_layout()
+    plot_path = output_dir / "confidence_distributions.png"
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  ✅ Confidence distributions saved to {plot_path}")
+    
+    # Interpretation
+    print(f"\n📊 Confidence Distribution Analysis:")
+    print(f"  Mean confidence (Normal Traffic): {mean_congestion:.3f}")
+    print(f"  Mean confidence (Real Incidents): {mean_incidents:.3f}")
+    print(f"  Separation: {separation:.3f}")
+    
+    if separation > 0.3:
+        print(f"  ✅ EXCELLENT - Strong separation, model is highly discriminative")
+    elif separation > 0.2:
+        print(f"  ✅ GOOD - Clear separation, model distinguishes well")
+    elif separation > 0.1:
+        print(f"  ⚠️  MODERATE - Some separation, but overlap exists")
+    else:
+        print(f"  ❌ POOR - Weak separation, model struggles to distinguish")
+    
+    print(f"  Overlap: {overlap_pct:.1f}% of normal traffic above threshold")
+
+
+def plot_detection_rate_vs_traffic(test_engineered: pd.DataFrame, y_test, y_pred: np.ndarray, output_dir: Path):
+    """
+    Plot Detection Rate (Recall) vs Traffic State
+    Companion to FAR plot - shows where model misses incidents
+    
+    Args:
+        test_engineered: Engineered test data
+        y_test: True labels
+        y_pred: Predicted labels
+        output_dir: Directory to save plots
+    """
+    print("\n📊 Generating Detection Rate vs Traffic State plot...")
+    
+    # Add predictions to dataframe
+    analysis_df = test_engineered.copy()
+    analysis_df['y_true'] = y_test
+    analysis_df['y_pred'] = y_pred
+    
+    # Calculate Detection Rate for each flow combination
+    # Detection Rate = TP / (TP + FN) = Recall
+    dr_data = []
+    
+    for mainline in sorted(analysis_df['flow_total'].unique()):
+        for onramp in sorted(analysis_df['onramp_flow'].unique()):
+            # Get data for this traffic state (only incidents)
+            mask = ((analysis_df['flow_total'] == mainline) & 
+                   (analysis_df['onramp_flow'] == onramp) &
+                   (analysis_df['incident_active'] == 1))  # Only real incidents
+            
+            if mask.sum() > 0:
+                subset = analysis_df[mask]
+                
+                # Calculate Detection Rate
+                tp = ((subset['y_true'] == 1) & (subset['y_pred'] == 1)).sum()
+                fn = ((subset['y_true'] == 1) & (subset['y_pred'] == 0)).sum()
+                
+                dr = (tp / (tp + fn) * 100) if (tp + fn) > 0 else 0
+                
+                dr_data.append({
+                    'mainline_flow': mainline,
+                    'onramp_flow': onramp,
+                    'detection_rate_percent': dr,
+                    'tp': tp,
+                    'fn': fn
+                })
+    
+    dr_df = pd.DataFrame(dr_data)
+    
+    # Check if DataFrame is empty (no incident data found)
+    if len(dr_df) == 0:
+        print("  ⚠️  No incident data found - skipping Detection Rate plot")
+        return None
+    
+    # Plot: Detection Rate vs Mainline Flow (with lines for each on-ramp flow)
+    plt.figure(figsize=(12, 7))
+    
+    for onramp in sorted(dr_df['onramp_flow'].unique()):
+        subset = dr_df[dr_df['onramp_flow'] == onramp]
+        plt.plot(subset['mainline_flow'], subset['detection_rate_percent'], 
+                marker='s', linewidth=2, markersize=8, 
+                label=f'On-ramp: {onramp} veh/h')
+    
+    plt.xlabel('Mainline Flow (veh/h)', fontsize=12)
+    plt.ylabel('Detection Rate / Recall (%)', fontsize=12)
+    plt.title('Incident Detection Rate vs Traffic State', fontsize=14, fontweight='bold')
+    plt.legend(title='On-ramp Flow', fontsize=10)
+    plt.grid(alpha=0.3)
+    plt.ylim([0, 105])  # 0-100% with some headroom
+    plt.tight_layout()
+    
+    plot_path = output_dir / "detection_rate_vs_traffic_state.png"
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  ✅ Detection Rate vs Traffic State saved to {plot_path}")
+    
+    return dr_df
+
+
+def main():
+    """Main function to test existing model on new dataset"""
+    
+    print("\n" + "="*70)
+    print("🧪 TESTING PRE-TRAINED MODEL ON NEW DATASET")
+    print("="*70 + "\n")
+    
+    # =========================================================================
+    # CONFIGURATION - USER FOLDER
+    # =========================================================================
+    # Create test folder if it doesn't exist
+    test_folder = config.base_dir / "test_model_with_set"
+    test_folder.mkdir(exist_ok=True)
+    
+    # Look for model and data files in the test folder
+    model_files = list(test_folder.glob("*.pkl"))
+    feature_files = list(test_folder.glob("*feature*.json"))
+    h5_files = list(test_folder.glob("*.h5"))
+    
+    # Check if files exist
+    if len(model_files) == 0:
+        print("❌ ERROR: No .pkl model file found in 'test_model_with_set' folder")
+        print(f"   Please add your trained model (.pkl file) to: {test_folder}")
+        return
+    
+    if len(feature_files) == 0:
+        print("❌ ERROR: No feature_columns.json file found in 'test_model_with_set' folder")
+        print(f"   Please add your feature_columns.json file to: {test_folder}")
+        return
+    
+    if len(h5_files) == 0:
+        print("❌ ERROR: No .h5 test data file found in 'test_model_with_set' folder")
+        print(f"   Please add your test dataset (.h5 file) to: {test_folder}")
+        return
+    
+    # Use the first file found of each type
+    model_path = model_files[0]
+    features_path = feature_files[0]
+    test_data_path = h5_files[0]
+    
+    # Output directory for this test run
+    output_dir = config.results_dir / "existing_model_test"
+    output_dir.mkdir(exist_ok=True)
+    
+    print(f"📁 Configuration:")
+    print(f"  Model:        {model_path.name}")
+    print(f"  Features:     {features_path.name}")
+    print(f"  Test data:    {test_data_path.name}")
+    print(f"  Output dir:   {output_dir}")
+    
+    # =========================================================================
+    # LOAD MODEL
+    # =========================================================================
+    model, feature_columns = load_pretrained_model(model_path, features_path)
+    
+    # =========================================================================
+    # LOAD AND PREPARE TEST DATA
+    # =========================================================================
+    print(f"\n📂 Loading test data...")
+    test_df = pd.read_hdf(test_data_path, key='data')
+    print(f"  ✅ Loaded {len(test_df):,} samples")
+    
+    # Engineer features
+    print(f"\n🔧 Engineering features...")
+    feature_engineer = FeatureEngineer()
+    test_engineered = feature_engineer.engineer_features(test_df)
+    
+    # Prepare features and labels
+    X_test = test_engineered[feature_columns]
+    y_test = test_engineered['incident_active']
+    
+    print(f"  ✅ Features prepared: {X_test.shape}")
+    print(f"  ✅ Test samples: {len(X_test):,} ({y_test.sum():,} incidents)")
+    
+    # =========================================================================
+    # EVALUATE MODEL
+    # =========================================================================
+    metrics, y_pred, y_pred_proba = evaluate_model(
+        model, X_test, y_test, 
+        dataset_name=test_data_path.stem
+    )
+    
+    # =========================================================================
+    # SAVE METRICS
+    # =========================================================================
+    print(f"\n💾 Saving results...")
+    
+    metrics_file = output_dir / "test_metrics.json"
+    with open(metrics_file, 'w') as f:
+        # Don't save predictions arrays (too large)
+        metrics_to_save = {k: v for k, v in metrics.items() if k != 'predictions'}
+        json.dump(metrics_to_save, f, indent=2)
+    print(f"  ✅ Metrics saved to {metrics_file}")
+    
+    # =========================================================================
+    # GENERATE PLOTS
+    # =========================================================================
+    print(f"\n{'='*70}")
+    print("📊 GENERATING POPULATION-LEVEL VISUALIZATIONS")
+    print("="*70)
+    
+    # A) Threshold Impact Analysis (FIRST - most important for congestion-only data)
+    threshold_df, recommended_threshold = analyze_threshold_impact(test_engineered, y_test, y_pred_proba, output_dir)
+    
+    # B) FAR vs Traffic State
+    far_df = plot_far_vs_traffic_state(test_engineered, y_test, y_pred, output_dir)
+    
+    # C) FAR Heatmap
+    plot_far_heatmap(far_df, output_dir)
+    
+    # D) Confidence Distributions (congestion vs incidents)
+    plot_confidence_distributions(test_engineered, y_test, y_pred_proba, output_dir)
+    
+    # E) Detection Rate vs Traffic State (bonus - shows where model misses)
+    dr_df = plot_detection_rate_vs_traffic(test_engineered, y_test, y_pred, output_dir)
+    
+    # =========================================================================
+    # SUMMARY
+    # =========================================================================
+    print(f"\n{'='*70}")
+    print("✅ TESTING COMPLETE")
+    print("="*70)
+    print(f"\n📊 Summary:")
+    print(f"  Dataset tested:       {test_data_path.name}")
+    print(f"  Total samples:        {len(X_test):,}")
+    print(f"  Incidents:            {y_test.sum():,}")
+    
+    if y_test.sum() == 0:
+        print(f"\n⚠️  CONGESTION-ONLY DATASET DETECTED")
+        print(f"  This dataset contains NO incidents (all normal traffic)")
+        print(f"  Metrics interpretation:")
+        print(f"    • FAR = {metrics['rates']['false_alarm_rate_percent']:.2f}% shows false alarms on normal traffic")
+        print(f"    • Detection Rate = N/A (no incidents to detect)")
+        print(f"    • This is PERFECT for testing California Algorithm benchmarking!")
+    else:
+        print(f"  Accuracy:             {metrics['accuracy']:.4f} ({metrics['accuracy']*100:.2f}%)")
+        print(f"  Detection Rate (TPR): {metrics['rates']['detection_rate_percent']:.2f}%")
+        print(f"  False Alarm Rate:     {metrics['rates']['false_alarm_rate_percent']:.2f}%")
+        print(f"  F1-Score:             {metrics['f1_score']:.4f}")
+    
+    print(f"\n📁 All results saved to: {output_dir}")
+    print(f"  • test_metrics.json")
+    print(f"  • threshold_impact_analysis.png  ← How to reduce FAR by changing threshold")
+    print(f"  • threshold_analysis.csv         ← Full threshold data")
+    print(f"  • far_vs_traffic_state.png       ← Shows where FAR explodes")
+    print(f"  • far_heatmap.png                ← Mainline × On-ramp FAR visualization")
+    print(f"  • confidence_distributions.png   ← Model separability")
+    if y_test.sum() > 0:
+        print(f"  • detection_rate_vs_traffic_state.png ← Where model misses incidents")
+    
+    if recommended_threshold:
+        print(f"\n💡 ACTION ITEM: Update config.py to use threshold {recommended_threshold:.2f} to reduce FAR!")
+    
+    print("\n" + "="*70)
+
+
+if __name__ == "__main__":
+    main()
