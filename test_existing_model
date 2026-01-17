@@ -7,6 +7,7 @@ Includes comprehensive metrics and visualizations
 import pandas as pd
 import numpy as np
 import pickle
+import joblib
 import json
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -35,7 +36,7 @@ def load_pretrained_model(model_path: Path, features_path: Path):
     print("📦 Loading pre-trained model...")
     
     with open(model_path, 'rb') as f:
-        model = pickle.load(f)
+        model = joblib.load(model_path)
     
     with open(features_path, 'r') as f:
         feature_columns = json.load(f)
@@ -497,7 +498,7 @@ def plot_confidence_distributions(test_engineered, y_test, y_pred_proba, output_
     
     # Plot 2: Box plots for statistical comparison
     data_to_plot = [congestion_only, real_incidents]
-    bp = ax2.boxplot(data_to_plot, labels=['Normal Traffic', 'Real Incidents'], 
+    bp = ax2.boxplot(data_to_plot, tick_labels=['Normal Traffic', 'Real Incidents'], 
                      patch_artist=True, showmeans=True, widths=0.6)
     bp['boxes'][0].set_facecolor('blue')
     bp['boxes'][1].set_facecolor('red')
