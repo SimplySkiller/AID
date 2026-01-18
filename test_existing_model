@@ -71,7 +71,7 @@ def evaluate_model(model, X_test, y_test, threshold, dataset_name="Test"):
     print(f"{'='*60}")
     
     # Predictions
-    y_pred_proba = model.predict_proba(X_test.values)[:, 1]
+    y_pred_proba = model.predict_proba(X_test)[:, 1]
     
     # === Confidence percentile diagnostics (threshold-independent) ===
 
@@ -93,6 +93,7 @@ def evaluate_model(model, X_test, y_test, threshold, dataset_name="Test"):
     print("Model has threshold:", hasattr(model, "decision_threshold"))
     # Use learned threshold if present, otherwise fallback
     print(f"🔧 FORCING USE OF LOADED THRESHOLD: {threshold:.4f}")
+    print(f" Type: {type(threshold)}, Value: {threshold}")
 
     y_pred = (y_pred_proba >= threshold).astype(int)
 
