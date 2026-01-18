@@ -20,9 +20,10 @@ from sklearn.metrics import (
 
 import config
 from model import FeatureEngineer
+#from model import threshold_path
 
 
-def load_pretrained_model(model_path: Path, features_path: Path):
+def load_pretrained_model(model_path: Path, features_path: Path, threshold_path: Path):
     """
     Load a pre-trained model and its feature columns
     
@@ -43,11 +44,16 @@ def load_pretrained_model(model_path: Path, features_path: Path):
     
     print(f"  ✅ Model loaded: {type(model).__name__}")
     print(f"  ✅ Features loaded: {len(feature_columns)} features")
+
+    #threshold_path = "results/decision_threshold.json"
+    with open(threshold_path, 'r') as f:
+        decision_threshold = json.load(f)["threshold"]
+    print("Loaded decision threshold:", decision_threshold)
     
-    return model, feature_columns
+    return model, feature_columns, decision_threshold
 
 
-def evaluate_model(model, X_test, y_test, dataset_name="Test"):
+def evaluate_model(model, X_test, y_test, threshold, dataset_name="Test"):
     """
     Comprehensive evaluation of model performance
     
@@ -65,9 +71,31 @@ def evaluate_model(model, X_test, y_test, dataset_name="Test"):
     print(f"{'='*60}")
     
     # Predictions
-    y_pred = model.predict(X_test.values)
     y_pred_proba = model.predict_proba(X_test.values)[:, 1]
     
+    # === Confidence percentile diagnostics (threshold-independent) ===
+
+    if (y_test == 0).sum() > 0:
+        p95_normal = np.percentile(y_pred_proba[y_test == 0], 95)
+        p99_normal = np.percentile(y_pred_proba[y_test == 0], 99)
+
+        print(f"\n📐 CONFIDENCE DIAGNOSTICS (Normal Traffic):")
+        print(f" 95th percentile: {p95_normal:.3f}")
+        print(f" 99th percentile: {p99_normal:.3f}")
+
+        if p95_normal < 0.2:
+            print(" ✅ Excellent separation (very low false alarm potential)")
+        elif p95_normal < 0.35:
+            print(" ⚠️ Moderate separation (threshold tuning required)")
+        else:
+            print(" ❌ Poor separation (model confuses congestion with incidents)")
+
+    print("Model has threshold:", hasattr(model, "decision_threshold"))
+    # Use learned threshold if present, otherwise fallback
+    print(f"🔧 FORCING USE OF LOADED THRESHOLD: {threshold:.4f}")
+
+    y_pred = (y_pred_proba >= threshold).astype(int)
+
     # Basic metrics
     accuracy = accuracy_score(y_test, y_pred)
     precision = precision_score(y_test, y_pred, zero_division=0)
@@ -315,7 +343,7 @@ def plot_detection_rate_vs_traffic(test_engineered, y_test, y_pred, output_dir):
     return dr_df
 
 
-def analyze_threshold_impact(test_engineered: pd.DataFrame, y_test, y_pred_proba, output_dir: Path):
+def analyze_threshold_impact(test_engineered: pd.DataFrame, y_test, y_pred_proba, threshold, output_dir: Path):
     """
     Analyze how different thresholds affect FAR
     Critical for congestion-only datasets
@@ -331,8 +359,8 @@ def analyze_threshold_impact(test_engineered: pd.DataFrame, y_test, y_pred_proba
     # Test different thresholds (include current threshold)
     thresholds = np.arange(0.1, 0.95, 0.05)
     # Make sure current threshold is included
-    if config.demo_confidence_threshold not in thresholds:
-        thresholds = np.sort(np.append(thresholds, config.demo_confidence_threshold))
+    if threshold not in thresholds:
+        thresholds = np.sort(np.append(thresholds, threshold))
     
     threshold_results = []
     
@@ -374,8 +402,8 @@ def analyze_threshold_impact(test_engineered: pd.DataFrame, y_test, y_pred_proba
              'r-o', linewidth=2, markersize=6, label='FAR')
     ax1.plot(results_df['threshold'], results_df['specificity_percent'], 
              'g-s', linewidth=2, markersize=6, label='Specificity (TNR)')
-    ax1.axvline(x=config.demo_confidence_threshold, color='orange', 
-                linestyle='--', linewidth=2, label=f'Current Threshold ({config.demo_confidence_threshold})')
+    ax1.axvline(x=threshold, color='orange', 
+                linestyle='--', linewidth=2, label=f'Current Threshold ({threshold})')
     ax1.set_xlabel('Detection Threshold', fontsize=12)
     ax1.set_ylabel('Rate (%)', fontsize=12)
     ax1.set_title('False Alarm Rate vs Threshold', fontsize=12)
@@ -393,12 +421,12 @@ def analyze_threshold_impact(test_engineered: pd.DataFrame, y_test, y_pred_proba
         recommended_far = acceptable.iloc[0]['far_percent']
         
         # Get current threshold FAR
-        current_threshold_row = results_df[results_df['threshold'].round(2) == round(config.demo_confidence_threshold, 2)]
+        current_threshold_row = results_df[results_df['threshold'].round(2) == round(threshold, 2)]
         if len(current_threshold_row) > 0:
             current_far = current_threshold_row['far_percent'].iloc[0]
         else:
             # Fallback: find closest threshold
-            idx = (results_df['threshold'] - config.demo_confidence_threshold).abs().idxmin()
+            idx = (results_df['threshold'] - threshold).abs().idxmin()
             current_far = results_df.loc[idx, 'far_percent']
         
         ax2.bar(['Current\nThreshold', 'Recommended\nThreshold'], 
@@ -431,14 +459,14 @@ def analyze_threshold_impact(test_engineered: pd.DataFrame, y_test, y_pred_proba
     
     # Print recommendations
     print(f"\n🎯 Threshold Recommendations:")
-    print(f"  Current threshold: {config.demo_confidence_threshold}")
+    print(f"  Current threshold: {threshold}")
     
     # Get current FAR (handle floating point comparison)
-    current_threshold_row = results_df[results_df['threshold'].round(2) == round(config.demo_confidence_threshold, 2)]
+    current_threshold_row = results_df[results_df['threshold'].round(2) == round(threshold, 2)]
     if len(current_threshold_row) > 0:
         current_far_val = current_threshold_row['far_percent'].iloc[0]
     else:
-        idx = (results_df['threshold'] - config.demo_confidence_threshold).abs().idxmin()
+        idx = (results_df['threshold'] - threshold).abs().idxmin()
         current_far_val = results_df.loc[idx, 'far_percent']
     
     print(f"  Current FAR: {current_far_val:.2f}%")
@@ -457,7 +485,7 @@ def analyze_threshold_impact(test_engineered: pd.DataFrame, y_test, y_pred_proba
     print(f"  💾 Full threshold analysis saved to {threshold_csv}")
     
     return results_df, recommended_threshold
-def plot_confidence_distributions(test_engineered, y_test, y_pred_proba, output_dir):
+def plot_confidence_distributions(test_engineered, y_test, y_pred_proba, threshold, output_dir):
     """
     Plot ML confidence distributions: congestion vs real incidents
     Shows model separability - key thesis figure
@@ -488,8 +516,8 @@ def plot_confidence_distributions(test_engineered, y_test, y_pred_proba, output_
              color='blue', edgecolor='black', density=True)
     ax1.hist(real_incidents, bins=50, alpha=0.6, label='Real Incidents', 
              color='red', edgecolor='black', density=True)
-    ax1.axvline(x=config.demo_confidence_threshold, color='green', 
-                linestyle='--', linewidth=2, label=f'Threshold ({config.demo_confidence_threshold})')
+    ax1.axvline(x=threshold, color='green', 
+                linestyle='--', linewidth=2, label=f'Threshold ({threshold})')
     ax1.set_xlabel('ML Confidence Score', fontsize=12)
     ax1.set_ylabel('Density', fontsize=12)
     ax1.set_title('Distribution Overlap', fontsize=12)
@@ -504,8 +532,8 @@ def plot_confidence_distributions(test_engineered, y_test, y_pred_proba, output_
     bp['boxes'][1].set_facecolor('red')
     for patch in bp['boxes']:
         patch.set_alpha(0.6)
-    ax2.axhline(y=config.demo_confidence_threshold, color='green', 
-                linestyle='--', linewidth=2, label=f'Threshold ({config.demo_confidence_threshold})')
+    ax2.axhline(y=threshold, color='green', 
+                linestyle='--', linewidth=2, label=f'Threshold ({threshold})')
     ax2.set_ylabel('ML Confidence Score', fontsize=12)
     ax2.set_title('Statistical Comparison', fontsize=12)
     ax2.legend(fontsize=10)
@@ -516,7 +544,7 @@ def plot_confidence_distributions(test_engineered, y_test, y_pred_proba, output_
     mean_incidents = real_incidents.mean()
     separation = mean_incidents - mean_congestion
     
-    overlap_pct = ((congestion_only > config.demo_confidence_threshold).sum() / len(congestion_only) * 100)
+    overlap_pct = ((congestion_only > threshold).sum() / len(congestion_only) * 100)
     
     textstr = f'Separation Metrics:\n'
     textstr += f'Mean (Normal): {mean_congestion:.3f}\n'
@@ -646,6 +674,7 @@ def main():
     # Look for model and data files in the test folder
     model_files = list(test_folder.glob("*.pkl"))
     feature_files = list(test_folder.glob("*feature*.json"))
+    threshold_files = list(test_folder.glob("*threshold*.json"))
     h5_files = list(test_folder.glob("*.h5"))
     
     # Check if files exist
@@ -667,6 +696,7 @@ def main():
     # Use the first file found of each type
     model_path = model_files[0]
     features_path = feature_files[0]
+    threshold_path = threshold_files[0]
     test_data_path = h5_files[0]
     
     # Output directory for this test run
@@ -682,7 +712,7 @@ def main():
     # =========================================================================
     # LOAD MODEL
     # =========================================================================
-    model, feature_columns = load_pretrained_model(model_path, features_path)
+    model, feature_columns, threshold = load_pretrained_model(model_path, features_path, threshold_path)
     
     # =========================================================================
     # LOAD AND PREPARE TEST DATA
@@ -707,7 +737,7 @@ def main():
     # EVALUATE MODEL
     # =========================================================================
     metrics, y_pred, y_pred_proba = evaluate_model(
-        model, X_test, y_test, 
+        model, X_test, y_test, threshold, 
         dataset_name=test_data_path.stem
     )
     
@@ -731,7 +761,7 @@ def main():
     print("="*70)
     
     # A) Threshold Impact Analysis (FIRST - most important for congestion-only data)
-    threshold_df, recommended_threshold = analyze_threshold_impact(test_engineered, y_test, y_pred_proba, output_dir)
+    threshold_df, recommended_threshold = analyze_threshold_impact(test_engineered, y_test, y_pred_proba, threshold, output_dir)
     
     # B) FAR vs Traffic State
     far_df = plot_far_vs_traffic_state(test_engineered, y_test, y_pred, output_dir)
@@ -740,7 +770,7 @@ def main():
     plot_far_heatmap(far_df, output_dir)
     
     # D) Confidence Distributions (congestion vs incidents)
-    plot_confidence_distributions(test_engineered, y_test, y_pred_proba, output_dir)
+    plot_confidence_distributions(test_engineered, y_test, y_pred_proba, threshold, output_dir)
     
     # E) Detection Rate vs Traffic State (bonus - shows where model misses)
     dr_df = plot_detection_rate_vs_traffic(test_engineered, y_test, y_pred, output_dir)
