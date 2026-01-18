@@ -326,6 +326,8 @@ class AIDModel:
         print(f"✅ TRAINING COMPLETE")
         print(f"{'='*60}")
         print(f"  Total time: {self.training_time/60:.1f} minutes ({self.training_time/3600:.2f} hours)")
+        print(f"FINAL TRAINED THRESHOLD: {self.decision_threshold}")
+        print(f"Model THRESHOLD:", getattr(self.model, "decision_threshold", None))
         
         # Validation performance
         print(f"\n{'='*60}")
@@ -333,6 +335,7 @@ class AIDModel:
         print(f"{'='*60}")
         y_val_proba = self.model.predict_proba(X_val)[:,1] # Validation probabilities
         self.select_decision_threshold(X_val, y_val) # Learn threshold from validation set
+        self.model.decision_threshold = self.decision_threshold
         y_val_pred = (y_val_proba >= self.decision_threshold).astype(int) # Apply threshold
         val_accuracy = accuracy_score(y_val, y_val_pred)
         val_precision = precision_score(y_val, y_val_pred, zero_division=0)
@@ -355,8 +358,8 @@ class AIDModel:
         y_proba = self.model.predict_proba(X_val)[:, 1]
         fpr, tpr, thresholds = roc_curve(y_val, y_proba)
 
-        # FAR constraint (1%)
-        max_far = 0.01
+        # FAR constraint for thershold picking
+        max_far = 0.0001 #0.01%
         valid = fpr <= max_far
 
         if not np.any(valid):
