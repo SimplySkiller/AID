@@ -347,6 +347,12 @@ class AIDModel:
         print(f"  Recall:    {val_recall:.4f}")
         print(f"  F1-score:  {val_f1:.4f}")
         print(f"  (Validation is used during training for model selection)")
+
+        self.evaluate_per_scenario(
+            val_df.reset_index(drop=True),
+            y_val_pred,
+            y_val_proba
+        )
     
     def select_decision_threshold(self, X_val: np.ndarray, y_val: np.ndarray):
         """
@@ -930,6 +936,63 @@ class AIDModel:
         
         print("✅ Model loaded successfully")
 
+
+    def evaluate_per_scenario(
+        self,
+        df: pd.DataFrame,
+        y_pred: np.ndarray,
+        y_pred_proba: np.ndarray,
+        min_confirmed_steps: int = 3
+    ):
+        """
+        Scenario-level evaluation:
+        One alert per scenario, optional persistence requirement.
+        """
+
+        scenario_results = []
+
+        for scenario_id, group in df.groupby("scenario_id"):
+            y_true = group["incident_active"].max()
+
+            idx = group.index.to_numpy()
+            preds = y_pred[idx]
+            probas = y_pred_proba[idx]
+
+            detected = preds.sum() >= min_confirmed_steps
+
+            # Time to detection
+            ttd = None
+            if y_true == 1 and detected:
+                incident_start = group[group["incident_active"] == 1]["sim_time"].iloc[0]
+                first_detect_idx = idx[np.where(preds == 1)[0][0]]
+                detect_time = df.loc[first_detect_idx, "sim_time"]
+                ttd = detect_time - incident_start
+
+            scenario_results.append({
+                "scenario_id": scenario_id,
+                "incident": int(y_true),
+                "detected": int(detected),
+                "time_to_detection": ttd
+            })
+
+        scenario_df = pd.DataFrame(scenario_results)
+
+        # Metrics
+        tp = ((scenario_df.incident == 1) & (scenario_df.detected == 1)).sum()
+        fn = ((scenario_df.incident == 1) & (scenario_df.detected == 0)).sum()
+        fp = ((scenario_df.incident == 0) & (scenario_df.detected == 1)).sum()
+        tn = ((scenario_df.incident == 0) & (scenario_df.detected == 0)).sum()
+
+        print("\n📊 SCENARIO-LEVEL METRICS")
+        print("=" * 60)
+        print(f"TP: {tp}, FN: {fn}, FP: {fp}, TN: {tn}")
+        print(f"Scenario FAR: {fp / (fp + tn + 1e-9):.2%}")
+        print(f"Detection Rate: {tp / (tp + fn + 1e-9):.2%}")
+
+        if scenario_df["time_to_detection"].notna().any():
+            print(f"Median Time-to-Detection: {scenario_df['time_to_detection'].median():.1f}s")
+
+        return scenario_df
 
 def train_and_evaluate(use_grid_refinement: bool = False, run_diagnostics: bool = True):
     """
