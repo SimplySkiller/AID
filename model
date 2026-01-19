@@ -205,7 +205,11 @@ class AIDModel:
         print("\n📉 Subsampling scenarios for hyperparameter tuning...")
         np.random.seed(config.random_state)
         unique_scenarios = train_df['scenario_id'].unique()
-        hp_scenario_count = min(int(0.02 * len(unique_scenarios)), 600) # Use 2% of scenarios or 600, whichever comes first. This is the HP tuning target
+        n_scenarios = len(unique_scenarios)
+        if n_scenarios <= 3000:
+            hp_scenario_count = n_scenarios
+        else:
+            hp_scenario_count = min(max(int(0.02 * n_scenarios), 400), 600) # Use 2% of scenarios or 600, whichever comes first. This is the HP tuning target
         
         hp_scenario_subset = np.random.choice(
             unique_scenarios, 
