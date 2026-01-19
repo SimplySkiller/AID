@@ -176,6 +176,55 @@ class CaliforniaAlgorithm:
         plt.close()
         print(f"💾 Confusion matrix saved to {save_path}")
 
+    def evaluate_california_per_scenario(
+        df: pd.DataFrame,
+        min_confirmed_steps: int = 3
+    ):
+        """
+        Scenario-level evaluation of California Algorithm
+        """
+
+        results = []
+
+        for scenario_id, group in df.groupby("scenario_id"):
+            y_true = group["incident_active"].max()
+
+            alarms = group["alarm"].values
+
+            detected = alarms.sum() >= min_confirmed_steps
+
+            # Time to detection (if applicable)
+            ttd = None
+            if y_true == 1 and detected:
+                incident_start = group[group["incident_active"] == 1]["sim_time"].iloc[0]
+                first_alarm_time = group.loc[group["alarm"] == 1, "sim_time"].iloc[0]
+                ttd = first_alarm_time - incident_start
+
+            results.append({
+                "scenario_id": scenario_id,
+                "incident": int(y_true),
+                "detected": int(detected),
+                "time_to_detection": ttd
+            })
+
+        scenario_df = pd.DataFrame(results)
+
+        tp = ((scenario_df.incident == 1) & (scenario_df.detected == 1)).sum()
+        fn = ((scenario_df.incident == 1) & (scenario_df.detected == 0)).sum()
+        fp = ((scenario_df.incident == 0) & (scenario_df.detected == 1)).sum()
+        tn = ((scenario_df.incident == 0) & (scenario_df.detected == 0)).sum()
+
+        print("\n📊 CALIFORNIA ALGORITHM — SCENARIO METRICS")
+        print("=" * 60)
+        print(f"TP: {tp}, FN: {fn}, FP: {fp}, TN: {tn}")
+        print(f"Scenario FAR: {fp / (fp + tn + 1e-9):.2%}")
+        print(f"Detection Rate: {tp / (tp + fn + 1e-9):.2%}")
+
+        if scenario_df["time_to_detection"].notna().any():
+            print(f"Median Time-to-Detection: {scenario_df['time_to_detection'].median():.1f}s")
+
+        return scenario_df
+
 
 def calculate_practical_score(dr, far, weight_dr=0.7, weight_far=0.3, far_penalty_threshold=10.0):
     """Calculate a practical score that balances detection rate and false alarm rate"""
