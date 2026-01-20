@@ -109,7 +109,7 @@ def evaluate_model(model, X_test, y_test, threshold, dataset_name="Test"):
         auc = None
     
     # Confusion matrix
-    cm = confusion_matrix(y_test, y_pred)
+    cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
     
     # Additional rates
@@ -144,7 +144,13 @@ def evaluate_model(model, X_test, y_test, threshold, dataset_name="Test"):
     
     print(f"\n📋 DETAILED CLASSIFICATION REPORT:")
     print(f"{'='*60}")
-    print(classification_report(y_test, y_pred, target_names=['No Incident', 'Incident']))
+    print(classification_report(
+        y_test, 
+        y_pred, 
+        labels=[0, 1], 
+        target_names=['No Incident', 'Incident'], 
+        zero_division=0
+    ))
     
     # Return metrics dictionary
     metrics = {
