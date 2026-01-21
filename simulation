@@ -1,0 +1,838 @@
+"""
+SUMO simulation module for AID thesis
+Handles scenario generation with mainline and on-ramp traffic, TraCI interaction, and data logging
+"""
+
+import traci
+import numpy as np
+import pandas as pd
+import random
+import time
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+import xml.etree.ElementTree as ET
+import atexit
+import sys
+from multiprocessing import Pool, cpu_count
+from functools import partial
+
+import config
+
+
+class SUMOSimulator:
+    """Manages SUMO simulations and data collection"""
+    
+    def __init__(self, gui_mode: bool = False):
+        """
+        Initialize simulator
+        
+        Args:
+            gui_mode: If True, use SUMO-GUI for visualization
+        """
+        self.gui_mode = gui_mode
+        self.sumo_binary = config.sumo_gui_binary if gui_mode else config.sumo_binary
+        self.current_step = 0
+        self.vehicle_counter = 0
+        self.log_data = []
+        self.temp_files = []  # Track temp files for cleanup
+        
+        # Random seed for reproducibility
+        random.seed(config.random_state)
+        np.random.seed(config.random_state)
+        
+        # Register cleanup on exit
+        atexit.register(self.cleanup)
+    
+    
+    def cleanup(self):
+        """Clean up temp files and close TraCI connections"""
+        # Close TraCI if still open
+        try:
+            if traci.isLoaded():
+                traci.close()
+        except:
+            pass
+        
+        # Clean up temp route files
+        for temp_file in self.temp_files:
+            try:
+                if temp_file.exists():
+                    temp_file.unlink()
+            except:
+                pass
+    
+    
+    def generate_route_file(self, 
+                       flow_total: int,
+                       onramp_flow: int,
+                       speed_factor_mean: float,
+                       output_file: Path) -> None:
+        """
+        Generate route file with realistic vehicle insertion for mainline and on-ramp
+        
+        Args:
+            flow_total: TOTAL mainline vehicles per hour (both lanes combined)
+            onramp_flow: On-ramp vehicles per hour (single lane)
+            speed_factor_mean: Mean speed factor for this scenario
+            output_file: Path to save route XML
+        """
+        root = ET.Element("routes")
+        
+        # Define mainline route (straight through highway)
+        mainline_route = ET.SubElement(root, "route", 
+                                    id="mainline",
+                                    edges="before_det1 det1 before_det2.1 before_det2.2 before_det2.3 det2 before_det3 det3 after_det3")
+        
+        # Define on-ramp route (merges onto highway)
+        onramp_route = ET.SubElement(root, "route",
+                                    id="onramp_route",
+                                    edges="onramp before_det2.2 before_det2.3 det2 before_det3 det3 after_det3")
+        
+        # Calculate base insertion intervals (seconds per vehicle)
+        mainline_interval = 3600.0 / flow_total if flow_total > 0 else float('inf')
+        onramp_interval = 3600.0 / onramp_flow if onramp_flow > 0 else float('inf')
+        
+        max_time = 600  # 10 minutes of insertions
+        
+        # Store vehicles with their depart times for sorting
+        all_vehicles = []
+        
+        # Generate mainline vehicles
+        if flow_total > 0:
+            mainline_time = 0.0
+            mainline_veh_id = 0
+            
+            while mainline_time < max_time:
+                # Determine lane based on preference
+                if random.random() < config.lane0_preference:
+                    target_lane = 0
+                else:
+                    target_lane = 1
+                
+                # Get speed factor from lane-specific distribution
+                if target_lane == 0:
+                    speed_factor = np.random.normal(
+                        config.speed_factor_lane0_mean,
+                        config.speed_factor_lane0_std
+                    )
+                else:
+                    speed_factor = np.random.normal(
+                        config.speed_factor_lane1_mean,
+                        config.speed_factor_lane1_std
+                    )
+                
+                # Clip to realistic range
+                speed_factor = np.clip(speed_factor, 
+                                    config.speed_factor_clip_min,
+                                    config.speed_factor_clip_max)
+                
+                # Store vehicle data
+                all_vehicles.append({
+                    'depart': mainline_time,
+                    'id': f"mainline_{mainline_veh_id}",
+                    'type': 'car',
+                    'route': 'mainline',
+                    'departLane': str(target_lane),
+                    'departSpeed': 'max',
+                    'speedFactor': f"{speed_factor:.3f}"
+                })
+                
+                mainline_veh_id += 1
+                
+                # Add jittered interval
+                jitter = random.uniform(config.insertion_jitter_min, 
+                                    config.insertion_jitter_max)
+                mainline_time += mainline_interval * jitter
+        else:
+            mainline_veh_id = 0
+        
+        # Generate on-ramp vehicles (if onramp_flow > 0)
+        if onramp_flow > 0:
+            onramp_time = 0.0  # Start on-ramp at the same time as mainline
+            onramp_veh_id = 0
+            
+            while onramp_time < max_time:
+                # On-ramp vehicles use on-ramp specific speed distribution
+                speed_factor = np.random.normal(
+                    config.speed_factor_onramp_mean,
+                    config.speed_factor_onramp_std
+                )
+                
+                # Clip to realistic range
+                speed_factor = np.clip(speed_factor,
+                                    config.speed_factor_clip_min,
+                                    config.speed_factor_clip_max)
+                
+                # Store vehicle data
+                all_vehicles.append({
+                    'depart': onramp_time,
+                    'id': f"onramp_{onramp_veh_id}",
+                    'type': 'car',
+                    'route': 'onramp_route',
+                    'departSpeed': 'max',
+                    'speedFactor': f"{speed_factor:.3f}"
+                })
+                
+                onramp_veh_id += 1
+                
+                # Add jittered interval
+                jitter = random.uniform(config.insertion_jitter_min,
+                                    config.insertion_jitter_max)
+                onramp_time += onramp_interval * jitter
+        else:
+            onramp_veh_id = 0
+        
+        # CRITICAL: Sort all vehicles by depart time!
+        all_vehicles.sort(key=lambda v: v['depart'])
+        
+        # Now add vehicles to XML in chronological order
+        for veh_data in all_vehicles:
+            veh_elem = ET.SubElement(root, "vehicle",
+                                    id=veh_data['id'],
+                                    type=veh_data['type'],
+                                    route=veh_data['route'],
+                                    depart=f"{veh_data['depart']:.2f}",
+                                    departSpeed=veh_data['departSpeed'])
+            
+            # Set speed factor
+            veh_elem.set("speedFactor", veh_data['speedFactor'])
+            
+            # Set departLane if it exists (only for mainline vehicles)
+            if 'departLane' in veh_data:
+                veh_elem.set("departLane", veh_data['departLane'])
+        
+        # Write to file
+        tree = ET.ElementTree(root)
+        ET.indent(tree, space="  ")
+        tree.write(output_file, encoding="utf-8", xml_declaration=True)
+        
+        # Track for cleanup
+        self.temp_files.append(output_file)
+        
+        # DEBUG OUTPUT - Always print this to see what was generated
+        print(f"  Generated {mainline_veh_id} mainline + {onramp_veh_id} onramp vehicles")
+        print(f"  Vehicles sorted by depart time: first at {all_vehicles[0]['depart']:.2f}s, last at {all_vehicles[-1]['depart']:.2f}s")
+    
+    
+    def start_simulation(self, route_file: Path, scenario_id: int = 0) -> None:
+        """Start SUMO with TraCI using a unique port for multiprocessing"""
+        # Close any existing connection first
+        try:
+            if traci.isLoaded():
+                traci.close()
+                time.sleep(0.5)  # Wait for connection to fully close
+        except:
+            pass
+        
+        sumo_cmd = [
+            self.sumo_binary,
+            "-c", str(config.sumo_cfg_file),
+            "--route-files", str(route_file),
+            "--step-length", str(config.sim_step_length),
+            "--no-warnings", "true",
+            "--no-step-log", "true",
+            "--time-to-teleport", "-1",
+            "--collision.action", "warn"
+        ]
+        
+        if not self.gui_mode:
+            sumo_cmd.append("--start")
+        
+        # Give each scenario a truly unique port
+        unique_port = 8813 + (scenario_id % 10000)
+        traci.start(sumo_cmd, port=unique_port, label=str(scenario_id))
+        
+        self.current_step = 0
+        self.log_data = []
+    
+    
+    def inject_incident(self, 
+                       position: float,
+                       lane: int,
+                       current_time: float,
+                       clear_after: Optional[float] = None) -> Optional[Tuple[str, Dict]]:
+        """
+        Inject an incident by slowing down a vehicle
+        
+        Args:
+            position: Position along highway (meters)
+            lane: Lane index (0 or 1)
+            current_time: Current simulation time
+            clear_after: If set, incident clears after this many seconds
+            
+        Returns:
+            Tuple of (vehicle_id, incident_info_dict) or None if no suitable vehicle
+        """
+        # Find vehicle closest to target position in target lane
+        all_vehicles = traci.vehicle.getIDList()
+        
+        best_vehicle = None
+        min_distance = float('inf')
+        best_abs_pos = None
+        
+        for veh_id in all_vehicles:
+            try:
+                veh_edge = traci.vehicle.getRoadID(veh_id)
+                veh_lane = traci.vehicle.getLaneIndex(veh_id)
+                veh_pos = traci.vehicle.getLanePosition(veh_id)
+                
+                # Calculate absolute position
+                if veh_edge == "before_det1":
+                    abs_pos = veh_pos
+                elif veh_edge == "det1":
+                    abs_pos = 475 + veh_pos
+                elif veh_edge == "before_det2.1":
+                    abs_pos = 525 + veh_pos
+                elif veh_edge == "before_det2.2":
+                    abs_pos = 540 + veh_pos
+                elif veh_edge == "before_det2.3":
+                    abs_pos = 804 + veh_pos
+                elif veh_edge == "det2":
+                    abs_pos = 975 + veh_pos
+                elif veh_edge == "before_det3":
+                    abs_pos = 1025 + veh_pos
+                elif veh_edge == "det3":
+                    abs_pos = 1475 + veh_pos
+                elif veh_edge == "after_det3":
+                    abs_pos = 1525 + veh_pos
+                else:
+                    continue
+                
+                # Check if in correct lane and close to target
+                # Note: before_det2.2 has 3 lanes (0=onramp, 1=mainline right, 2=mainline left)
+                # We need to map our 2-lane system to this 3-lane section
+                if veh_edge == "before_det2.2":
+                    target_veh_lane = lane + 1  # Shift because lane 0 is onramp
+                else:
+                    target_veh_lane = lane
+                
+                if veh_lane == target_veh_lane:
+                    distance = abs(abs_pos - position)
+                    if distance < min_distance:
+                        min_distance = distance
+                        best_vehicle = veh_id
+                        best_abs_pos = abs_pos
+            
+            except traci.exceptions.TraCIException:
+                continue
+        
+        if best_vehicle and min_distance < 100:  # Within 100m is acceptable
+            # Get vehicle info before incident
+            current_speed = traci.vehicle.getSpeed(best_vehicle)
+            current_speed_kmh = current_speed * 3.6
+            veh_edge = traci.vehicle.getRoadID(best_vehicle)
+            
+            # Calculate incident speed
+            incident_speed = current_speed * config.incident_severity
+            incident_speed_kmh = incident_speed * 3.6
+            
+            # Set speed immediately
+            traci.vehicle.setSpeed(best_vehicle, incident_speed)
+            
+            # CRITICAL: Disable lane changing to keep incident in intended lane
+            traci.vehicle.setLaneChangeMode(best_vehicle, 0)
+            
+            # Change color to RED in GUI
+            traci.vehicle.setColor(best_vehicle, (255, 0, 0, 255))
+            
+            # Track vehicle in GUI (camera follows it) - only if GUI is active
+            if self.gui_mode:
+                try:
+                    view_id = traci.gui.getIDList()[0] if len(traci.gui.getIDList()) > 0 else None
+                    if view_id:
+                        traci.gui.trackVehicle(view_id, best_vehicle)
+                        traci.gui.setZoom(view_id, 2000)
+                except:
+                    pass
+            
+            # Create incident info dictionary
+            incident_info = {
+                'vehicle_id': best_vehicle,
+                'time': current_time,
+                'position': best_abs_pos,
+                'target_position': position,
+                'lane': lane,
+                'edge': veh_edge,
+                'speed_before_kmh': current_speed_kmh,
+                'speed_after_kmh': incident_speed_kmh,
+                'severity': config.incident_severity
+            }
+            
+            # Print detailed incident information
+            if config.show_incident_details and (self.gui_mode or config.debug_mode):
+                lane_name = "Right (slow)" if lane == 0 else "Left (fast)"
+                print(f"\n{'='*60}")
+                print(f"🚨 INCIDENT INJECTED")
+                print(f"{'='*60}")
+                print(f"  Time:        {current_time:.1f}s")
+                print(f"  Vehicle ID:  {best_vehicle}")
+                print(f"  Location:    {best_abs_pos:.1f}m (target: {position}m)")
+                print(f"  Lane:        {lane} ({lane_name})")
+                print(f"  Edge:        {veh_edge}")
+                print(f"  Speed:       {current_speed_kmh:.1f} km/h → {incident_speed_kmh:.1f} km/h")
+                print(f"{'='*60}\n")
+            
+            return best_vehicle, incident_info
+        
+        return None, None
+    
+    
+    def collect_detector_data(self) -> Dict:
+        """
+        Collect data from all detector zones
+        
+        Returns:
+            Dictionary with detector measurements
+        """
+        data = {
+            'sim_time': traci.simulation.getTime(),
+            'step': self.current_step
+        }
+        
+        for det_edge in config.detector_edges:
+            try:
+                # Get measurements for this detector zone
+                speed_mean = traci.edge.getLastStepMeanSpeed(det_edge)
+                vehicle_count = traci.edge.getLastStepVehicleNumber(det_edge)
+                occupancy = traci.edge.getLastStepOccupancy(det_edge)
+                
+                # Get vehicle IDs for detailed stats
+                vehicle_ids = traci.edge.getLastStepVehicleIDs(det_edge)
+                speeds = [traci.vehicle.getSpeed(v) for v in vehicle_ids]
+                
+                # Calculate statistics
+                speed_std = np.std(speeds) if len(speeds) > 0 else 0.0
+                speed_min = np.min(speeds) if len(speeds) > 0 else 0.0
+                flow = vehicle_count
+                
+                # Store measurements
+                data[f'{det_edge}_speed_mean'] = speed_mean
+                data[f'{det_edge}_speed_std'] = speed_std
+                data[f'{det_edge}_speed_min'] = speed_min
+                data[f'{det_edge}_flow'] = flow
+                data[f'{det_edge}_occupancy'] = occupancy
+                data[f'{det_edge}_vehicle_count'] = vehicle_count
+                
+            except traci.exceptions.TraCIException as e:
+                if config.debug_mode:
+                    print(f"  Warning: Could not read {det_edge}: {e}")
+                # Fill with zeros if detector unavailable
+                data[f'{det_edge}_speed_mean'] = 0.0
+                data[f'{det_edge}_speed_std'] = 0.0
+                data[f'{det_edge}_speed_min'] = 0.0
+                data[f'{det_edge}_flow'] = 0
+                data[f'{det_edge}_occupancy'] = 0.0
+                data[f'{det_edge}_vehicle_count'] = 0
+        
+        return data
+    
+    
+    def run_scenario(self,
+                flow_total: int,
+                onramp_flow: int,
+                speed_factor_mean: float,
+                has_incident: bool,
+                incident_position: float,
+                scenario_id: int,
+                total_scenarios: int) -> Optional[pd.DataFrame]:
+        """
+        Run a complete scenario
+        
+        Args:
+            flow_total: TOTAL mainline traffic flow (veh/hour, both lanes)
+            onramp_flow: On-ramp traffic flow (veh/hour, single lane)
+            speed_factor_mean: Mean speed factor
+            has_incident: Whether to inject incident
+            incident_position: Where to inject incident (meters)
+            scenario_id: Unique scenario identifier (1-indexed for display)
+            total_scenarios: Total number of scenarios
+            
+        Returns:
+            DataFrame with logged data, or None if error
+        """
+        # Print progress
+        if config.show_progress:
+            incident_str = "WITH" if has_incident else "NO"
+            print(f"Scenario {scenario_id}/{config.total_scenarios}: "
+                f"Mainline={flow_total} veh/h, Onramp={onramp_flow} veh/h, "
+                f"Speed={speed_factor_mean:.1f}, {incident_str} incident @ {incident_position}m")
+        
+        try:
+            # Generate route file (use 0-indexed for actual ID)
+            route_file = config.base_dir / f"routes_temp_{scenario_id-1}.rou.xml"
+            self.generate_route_file(flow_total, onramp_flow, speed_factor_mean, route_file)
+            
+            # Start simulation with unique port for multiprocessing
+            self.start_simulation(route_file, scenario_id)
+            
+            # Incident tracking
+            incident_injected = False
+            incident_vehicle = None
+            incident_info = None
+            incident_time = None
+            incident_lane = random.choice(config.incident_lane_distribution)
+            
+            if has_incident:
+                # Randomize incident timing
+                incident_time = random.uniform(config.incident_start_time_min,
+                                            config.incident_start_time_max)
+                
+                # Determine if incident will clear
+                will_clear = random.random() < config.incident_clearing_probability
+                if will_clear:
+                    clear_duration = random.uniform(config.incident_clearing_duration_min,
+                                                config.incident_clearing_duration_max)
+                    incident_clear_time = incident_time + clear_duration
+                else:
+                    incident_clear_time = None
+            
+            # Calculate minimum simulation time before checking for early termination
+            # If we have on-ramp flow, we need to wait for warmup + buffer to let vehicles populate
+            onramp_buffer = 60.0 if onramp_flow > 0 else 0.0
+            min_simulation_time = config.warmup_time + onramp_buffer
+            
+            # Simulation loop
+            last_log_time = 0.0
+            last_print_time = 0.0
+            
+            while traci.simulation.getMinExpectedNumber() > 0:
+                traci.simulationStep()
+                self.current_step += 1
+                current_time = traci.simulation.getTime()
+                
+                # Print timestep updates
+                if (config.show_timestep_updates and 
+                    current_time - last_print_time >= config.timestep_update_interval):
+                    num_vehicles = len(traci.vehicle.getIDList())
+                    print(f"  t={current_time:.1f}s, vehicles={num_vehicles}", end='\r')
+                    last_print_time = current_time
+                
+                # Inject incident if needed
+                if has_incident and not incident_injected and current_time >= incident_time:
+                    incident_vehicle, incident_info = self.inject_incident(
+                        incident_position, incident_lane, current_time
+                    )
+                    if incident_vehicle:
+                        incident_injected = True
+                
+                # Clear incident if needed
+                if (incident_injected and incident_clear_time and 
+                    current_time >= incident_clear_time):
+                    if incident_vehicle in traci.vehicle.getIDList():
+                        # Release speed control
+                        traci.vehicle.setSpeed(incident_vehicle, -1)
+                        
+                        # Re-enable lane changing
+                        traci.vehicle.setLaneChangeMode(incident_vehicle, 597)
+                        
+                        # Change color back to white
+                        traci.vehicle.setColor(incident_vehicle, (255, 255, 255, 255))
+                        
+                        # Stop tracking in GUI
+                        if self.gui_mode:
+                            try:
+                                view_id = traci.gui.getIDList()[0] if len(traci.gui.getIDList()) > 0 else None
+                                if view_id:
+                                    traci.gui.trackVehicle(view_id, "")
+                            except:
+                                pass
+                        
+                        if config.show_incident_details and (self.gui_mode or config.debug_mode):
+                            print(f"\n{'='*60}")
+                            print(f"✅ INCIDENT CLEARED")
+                            print(f"{'='*60}")
+                            print(f"  Time:        {current_time:.1f}s")
+                            print(f"  Duration:    {current_time - incident_info['time']:.1f}s")
+                            print(f"{'='*60}\n")
+                    incident_clear_time = None
+                
+                # Log data at specified frequency
+                if current_time - last_log_time >= config.log_frequency:
+                    data_point = self.collect_detector_data()
+                    data_point['scenario_id'] = scenario_id - 1  # Store 0-indexed
+                    data_point['flow_total'] = flow_total
+                    data_point['onramp_flow'] = onramp_flow
+                    data_point['speed_factor_mean'] = speed_factor_mean
+                    data_point['has_incident'] = 1 if has_incident else 0
+                    data_point['incident_position'] = incident_position if has_incident else 0
+                    data_point['incident_active'] = 1 if (incident_injected and 
+                                                        (incident_clear_time is None or 
+                                                        current_time < incident_clear_time)) else 0
+                    
+                    self.log_data.append(data_point)
+                    last_log_time = current_time
+                
+                # Check if we should end - FIXED EARLY TERMINATION
+                total_vehicles = len(traci.vehicle.getIDList())
+                non_incident_vehicles = total_vehicles - (1 if incident_injected and incident_vehicle in traci.vehicle.getIDList() else 0)
+                
+                # Only check for early termination after minimum simulation time
+                if (current_time > min_simulation_time and 
+                    non_incident_vehicles < config.min_vehicles_to_end):
+                    if config.debug_mode:
+                        print(f"\n  Ending simulation: only {non_incident_vehicles} non-incident vehicles left")
+                    break
+            
+            # Clear the timestep line
+            if config.show_timestep_updates:
+                print()
+            
+            # Close simulation
+            traci.close()
+            time.sleep(0.2)
+            
+            # Clean up temp route file
+            if route_file.exists():
+                route_file.unlink()
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(self.log_data)
+            self.log_data = []
+            
+            return df
+        
+        except Exception as e:
+            print(f"\n  ❌ Error in scenario {scenario_id}: {e}")
+            try:
+                if traci.isLoaded():
+                    traci.close()
+                time.sleep(0.5)
+            except:
+                pass
+            
+            try:
+                route_file = config.base_dir / f"routes_temp_{scenario_id-1}.rou.xml"
+                if route_file.exists():
+                    route_file.unlink()
+            except:
+                pass
+            
+            return None
+
+
+def _run_single_scenario_wrapper(scenario: Dict) -> Optional[pd.DataFrame]:
+    """Wrapper function for multiprocessing"""
+    simulator = SUMOSimulator(gui_mode=False)
+    try:
+        return simulator.run_scenario(**scenario)
+    except Exception as e:
+        print(f"  ❌ Error in scenario {scenario['scenario_id']}: {e}")
+        return None
+
+
+def run_batch_simulations(start_idx: int = 0, end_idx: Optional[int] = None, use_multiprocessing: bool = True):
+    """
+    Run all scenarios in batch mode
+    
+    Args:
+        start_idx: Starting scenario index (for resuming)
+        end_idx: Ending scenario index (None = run all)
+        use_multiprocessing: Use parallel processing (default True)
+    """
+    print("\n" + "="*60)
+    print("STARTING BATCH SIMULATION MODE")
+    if use_multiprocessing:
+        print(f"Using {config.num_workers} parallel workers")
+    print("="*60 + "\n")
+    
+    # Calculate total number of scenarios (needed because no incident would get multiplied by incident positions)
+    temp_total = 0
+    for has_incident in [False, True]:
+        for flow in range(config.flow_min, config.flow_max + 1, config.flow_step):
+            if has_incident and flow > 2400:
+                continue
+                
+            for onramp in range(config.onramp_flow_min, config.onramp_flow_max + 1, config.onramp_flow_step):
+                if has_incident and onramp > 1000:
+                    continue
+
+                for speed_factor in np.arange(config.speed_factor_min, 
+                                            config.speed_factor_max + 0.01, 
+                                            config.speed_factor_step):
+                    # Optimization: 1 pass for baseline, multiple for incidents
+                    current_positions = config.incident_positions if has_incident else [None]
+                    for _ in current_positions:
+                        temp_total += 1
+
+    config.total_scenarios = temp_total
+    # Generate all scenario combinations
+    scenarios = []
+    scenario_id = 0
+    
+    for has_incident in [False, True]:
+        for flow in range(config.flow_min, config.flow_max + 1, config.flow_step):
+            for onramp in range(config.onramp_flow_min, config.onramp_flow_max + 1, config.onramp_flow_step):
+                if has_incident and (flow > 2400 or onramp > 1000):
+                    continue
+                for speed_factor in np.arange(config.speed_factor_min, 
+                                              config.speed_factor_max + 0.01, 
+                                              config.speed_factor_step):
+                    current_positions = config.incident_positions if has_incident else [None]
+                    for incident_pos in current_positions:
+                        scenarios.append({
+                            'scenario_id': scenario_id + 1,
+                            'flow_total': flow,
+                            'onramp_flow': onramp,
+                            'speed_factor_mean': round(speed_factor, 1),
+                            'has_incident': has_incident,
+                            'incident_position': incident_pos,
+                            'total_scenarios': config.total_scenarios
+                        })
+                        scenario_id += 1
+    
+    # Filter scenarios by index
+    if end_idx is None:
+        end_idx = len(scenarios)
+    scenarios = scenarios[start_idx:end_idx]
+    
+    print(f"Running scenarios {start_idx+1} to {end_idx} ({len(scenarios)} total)\n")
+    
+    # Run scenarios and collect data
+    start_time = time.time()
+    
+    if use_multiprocessing and config.num_workers > 1:
+        print(f"⚡ Running simulations in parallel with {config.num_workers} workers...\n")
+        with Pool(processes=config.num_workers) as pool:
+            all_data = list(pool.imap(_run_single_scenario_wrapper, scenarios))
+    else:
+        print("🌐 Running simulations sequentially...\n")
+        all_data = []
+        for scenario in scenarios:
+            df = _run_single_scenario_wrapper(scenario)
+            all_data.append(df)
+    
+    # Filter out None results
+    all_data = [df for df in all_data if df is not None and len(df) > 0]
+    
+    successful_scenarios = len(all_data)
+    failed_scenarios = len(scenarios) - successful_scenarios
+    
+    print(f"\n📊 Simulation Summary:")
+    print(f"   Successful: {successful_scenarios}/{len(scenarios)}")
+    print(f"   Failed: {failed_scenarios}/{len(scenarios)}")
+    
+    if len(all_data) == 0:
+        print("\n❌ No data collected! All simulations failed.")
+        return
+    
+    # Combine all data
+    combined_df = pd.concat(all_data, ignore_index=True)
+
+    # Save complete combined dataset before splitting
+    print(f"\n💾 Saving complete combined dataset...")
+    combined_h5 = config.data_dir / "all_data.h5"
+    combined_df.to_hdf(combined_h5, key='data', mode='w', format='table')
+    print(f"   ✅ Complete dataset saved to {combined_h5}. Total samples: {len(combined_df):,}")
+    
+    # Split into train/val/test
+    scenario_ids = combined_df['scenario_id'].unique()
+    np.random.shuffle(scenario_ids)
+    
+    n_train = int(len(scenario_ids) * config.train_ratio)
+    n_val = int(len(scenario_ids) * config.val_ratio)
+    
+    train_ids = scenario_ids[:n_train]
+    val_ids = scenario_ids[n_train:n_train+n_val]
+    test_ids = scenario_ids[n_train+n_val:]
+    
+    train_df = combined_df[combined_df['scenario_id'].isin(train_ids)]
+    val_df = combined_df[combined_df['scenario_id'].isin(val_ids)]
+    test_df = combined_df[combined_df['scenario_id'].isin(test_ids)]
+    
+    # Save to HDF5
+    print(f"\n💾 Saving data to HDF5...")
+    train_df.to_hdf(config.train_h5, key='data', mode='w', format='table')
+    val_df.to_hdf(config.val_h5, key='data', mode='w', format='table')
+    test_df.to_hdf(config.test_h5, key='data', mode='w', format='table')
+    
+    elapsed = time.time() - start_time
+    print(f"\n✅ Batch simulation complete!")
+    print(f"   Time elapsed: {elapsed/60:.1f} minutes ({elapsed/3600:.1f} hours)")
+    print(f"   Average time per scenario: {elapsed/len(scenarios):.1f} seconds")
+    print(f"   Train samples: {len(train_df):,}")
+    print(f"   Val samples: {len(val_df):,}")
+    print(f"   Test samples: {len(test_df):,}")
+    
+    # Verify HDF5 integrity
+    print(f"\n🔍 Verifying HDF5 Integrity...")
+    for name, path in [("Train", config.train_h5), ("Val", config.val_h5), ("Test", config.test_h5)]:
+        try:
+            check_df = pd.read_hdf(path, key='data', stop=5)
+            full_count = len(pd.read_hdf(path, key='data'))
+            print(f"  ✅ {name:5s} file healthy. Columns: {len(check_df.columns)}, Rows: {full_count:,}")
+        except Exception as e:
+            print(f"  ❌ {name:5s} file ERROR: {e}")
+
+
+def run_single_simulation(flow_total: int = 2400,
+                         onramp_flow: int = 1000,
+                         speed_factor_mean: float = 1.0,
+                         has_incident: bool = True,
+                         incident_position: float = 800):
+    """
+    Run a single scenario in GUI mode for debugging
+    
+    Args:
+        flow_total: TOTAL mainline traffic flow (both lanes) - default 2000 veh/h
+        onramp_flow: On-ramp traffic flow (single lane) - default 400 veh/h
+        speed_factor_mean: Mean speed factor - default 1.0 (130 km/h)
+        has_incident: Whether to inject incident - default True
+        incident_position: Where to inject incident - default 500m
+    """
+    print("\n" + "="*60)
+    print("STARTING SINGLE SIMULATION MODE (GUI)")
+    print("="*60)
+    print(f"Settings:")
+    print(f"  Mainline flow: {flow_total} veh/h (total, both lanes)")
+    print(f"  On-ramp flow: {onramp_flow} veh/h")
+    print(f"  Speed factor: {speed_factor_mean} ({speed_factor_mean*config.speed_limit_kmh:.0f} km/h mean)")
+    print(f"  Incident: {'YES' if has_incident else 'NO'}")
+    if has_incident:
+        print(f"  Incident position: {incident_position}m")
+    print("="*60 + "\n")
+    
+    simulator = SUMOSimulator(gui_mode=True)
+    
+    df = simulator.run_scenario(
+        flow_total=flow_total,
+        onramp_flow=onramp_flow,
+        speed_factor_mean=speed_factor_mean,
+        has_incident=has_incident,
+        incident_position=incident_position,
+        scenario_id=1,
+        total_scenarios=1
+    )
+    
+    if df is not None:
+        print(f"\n✅ Simulation complete! Collected {len(df)} data points")
+        print(f"\nFirst few rows:")
+        print(df.head())
+        print(f"\nData summary:")
+        print(f"  Duration: {df['sim_time'].max():.1f} seconds")
+        print(f"  Samples: {len(df)}")
+        if has_incident:
+            incident_samples = df[df['incident_active'] == 1]
+            print(f"  Incident active samples: {len(incident_samples)}")
+        
+        return df
+    else:
+        print(f"\n❌ Simulation failed!")
+        return None
+
+
+if __name__ == "__main__":
+    # ============================================================================
+    # EDIT THIS LINE TO SWITCH MODES
+    # ============================================================================
+    MODE = "batch"  # Change to "batch" for full run, "test" for first 10 scenarios
+    # ============================================================================
+    
+    if MODE == "single":
+        run_single_simulation()
+    elif MODE == "batch":
+        run_batch_simulations()
+    elif MODE == "test":
+        # Run first 10 scenarios for testing
+        run_batch_simulations(start_idx=0, end_idx=10)
+    else:
+        print("❌ Invalid MODE. Set to 'single', 'batch', or 'test'")
