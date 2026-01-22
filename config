@@ -35,14 +35,22 @@ test_h5 = data_dir / "test.h5"
 sim_step_length = 0.1  # 10Hz simulation (seconds)
 log_frequency = 1.0    # Log every 1 second (as discussed)
 warmup_time = 60       # Warmup period before incidents can occur (seconds) - enough for traffic to stabilize
-min_vehicles_to_end = 2  # End simulation when fewer non-incident vehicles remain (changed from 10 to 2)
+min_vehicles_to_end = 2  # End simulation when fewer non-incident vehicles remain (changed from 10 to 2). DEPRECATED - now we wait for full incident lifecycle completion
 min_incident_observation_time = 120  # Minimum time to observe incident effects before allowing early exit (seconds)
+
+# Steady-state and lifecycle parameters
+first_vehicle_must_complete = True  # Wait for first vehicle to complete route before logging
+steady_state_buffer_time = 30  # Extra time after first vehicle completes (seconds)
+max_simulation_time = 12000  # Hard limit: 200 minutes (3.3 hours) max per scenario (seconds) - allows slow incident vehicles to traverse full 2.5km network
+recovery_detection_window = 60  # Time window to check for recovery (seconds)
+recovery_speed_threshold = 0.85  # Speed must recover to 85% of baseline to consider "recovered"
+recovery_occupancy_threshold = 0.15  # Occupancy must drop below 15% to consider "recovered"
 
 # ============================================================================
 # NETWORK PARAMETERS
 # ============================================================================
 detector_edges = ["det1", "det2", "det3"]  # 50m detector zones
-detector_positions = [500, 1000, 1500]      # Approximate positions (meters)
+detector_positions = [1600, 2097, 2597]  # Detector midpoints after extending before_det1 to 1595m      # Approximate positions (meters)
 speed_limit_ms = 36.11  # 130 km/h in m/s
 speed_limit_kmh = 130   # For reference
 network_length = 2000   # meters
@@ -73,7 +81,9 @@ speed_factor_step = 0.1
 
 # Incident position iteration
 # Baseline: 4 positions for good coverage without excessive scenarios
-incident_positions = [400, 500, 750, 1000]  # meters from start
+# Incident positions (absolute meters from network start)
+# All positions are on before_det1 (0-1595m) or between detectors
+incident_positions = [400, 800, 1200, 1700]  # Spread across: before det1, between det1-det2, between det2-det3
 
 # Calculate total scenarios
 num_mainline_flows = int((flow_max - flow_min) / flow_step) + 1  # 12 flows (200-2400 step 200)
