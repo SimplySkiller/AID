@@ -35,10 +35,24 @@ class SUMOSimulator:
         self.vehicle_counter = 0
         self.log_data = []
         self.temp_files = []  # Track temp files for cleanup
+
+        self.logging_active = False  # Track whether logging has started
+        self.first_vehicle_completed = False  # Track first vehicle completion
+        self.baseline_speeds = {}  # Store baseline speeds per detector for recovery detection
+        self.baseline_occupancies = {}  # Store baseline occupancies per detector
         
         # Random seed for reproducibility
-        random.seed(config.random_state)
-        np.random.seed(config.random_state)
+        # For GUI mode, use time-based seed for variety. For batch, use fixed seed for reproducibility.
+        if gui_mode:
+            # Use current time for true randomness in GUI testing
+            import time
+            seed_value = int(time.time() * 1000) % (2**32 - 1)  # Keep within numpy's 32-bit limit
+            random.seed(seed_value)
+            np.random.seed(seed_value)
+        else:
+            # Use fixed seed for reproducible batch runs
+            random.seed(config.random_state)
+            np.random.seed(config.random_state)
         
         # Register cleanup on exit
         atexit.register(self.cleanup)
@@ -92,7 +106,7 @@ class SUMOSimulator:
         mainline_interval = 3600.0 / flow_total if flow_total > 0 else float('inf')
         onramp_interval = 3600.0 / onramp_flow if onramp_flow > 0 else float('inf')
         
-        max_time = 600  # 10 minutes of insertions
+        max_time = 6400  # 30 minutes of insertions - ensures enough vehicles for long incident scenarios
         
         # Store vehicles with their depart times for sorting
         all_vehicles = []
@@ -277,24 +291,25 @@ class SUMOSimulator:
                 veh_pos = traci.vehicle.getLanePosition(veh_id)
                 
                 # Calculate absolute position
+                # Calculate absolute position (offsets account for extended before_det1)
                 if veh_edge == "before_det1":
-                    abs_pos = veh_pos
+                    abs_pos = veh_pos  # Starts at 0
                 elif veh_edge == "det1":
-                    abs_pos = 475 + veh_pos
+                    abs_pos = 1595 + veh_pos  # Starts at 1595m
                 elif veh_edge == "before_det2.1":
-                    abs_pos = 525 + veh_pos
+                    abs_pos = 1605 + veh_pos  # Starts at 1605m
                 elif veh_edge == "before_det2.2":
-                    abs_pos = 540 + veh_pos
+                    abs_pos = 1640 + veh_pos  # Starts at 1640m (after 35m of before_det2.1)
                 elif veh_edge == "before_det2.3":
-                    abs_pos = 804 + veh_pos
+                    abs_pos = 1901 + veh_pos  # Starts at 1901m (after 253m merge + 8m junction)
                 elif veh_edge == "det2":
-                    abs_pos = 975 + veh_pos
+                    abs_pos = 2092 + veh_pos  # Starts at 2092m
                 elif veh_edge == "before_det3":
-                    abs_pos = 1025 + veh_pos
+                    abs_pos = 2102 + veh_pos  # Starts at 2102m
                 elif veh_edge == "det3":
-                    abs_pos = 1475 + veh_pos
+                    abs_pos = 2592 + veh_pos  # Starts at 2592m
                 elif veh_edge == "after_det3":
-                    abs_pos = 1525 + veh_pos
+                    abs_pos = 2602 + veh_pos  # Starts at 2602m
                 else:
                     continue
                 
@@ -336,12 +351,18 @@ class SUMOSimulator:
             traci.vehicle.setColor(best_vehicle, (255, 0, 0, 255))
             
             # Track vehicle in GUI (camera follows it) - only if GUI is active
+            # Center camera on incident but don't lock - only if GUI is active
             if self.gui_mode:
                 try:
                     view_id = traci.gui.getIDList()[0] if len(traci.gui.getIDList()) > 0 else None
                     if view_id:
+                        # Temporarily track to center camera, then release
                         traci.gui.trackVehicle(view_id, best_vehicle)
                         traci.gui.setZoom(view_id, 2000)
+                        # Immediately stop tracking so user can move camera
+                        import time
+                        time.sleep(0.1)  # Brief pause to let camera center
+                        traci.gui.trackVehicle(view_id, "")  # Release tracking
                 except:
                     pass
             
@@ -377,9 +398,12 @@ class SUMOSimulator:
         return None, None
     
     
-    def collect_detector_data(self) -> Dict:
+    def collect_detector_data(self, update_baseline: bool = False) -> Dict:
         """
         Collect data from all detector zones
+        
+        Args:
+            update_baseline: If True, update baseline values for recovery detection
         
         Returns:
             Dictionary with detector measurements
@@ -413,6 +437,11 @@ class SUMOSimulator:
                 data[f'{det_edge}_occupancy'] = occupancy
                 data[f'{det_edge}_vehicle_count'] = vehicle_count
                 
+                # Update baselines if requested (only during pre-incident steady state)
+                if update_baseline and speed_mean > 0:
+                    self.baseline_speeds[det_edge] = speed_mean
+                    self.baseline_occupancies[det_edge] = occupancy
+                
             except traci.exceptions.TraCIException as e:
                 if config.debug_mode:
                     print(f"  Warning: Could not read {det_edge}: {e}")
@@ -426,7 +455,45 @@ class SUMOSimulator:
         
         return data
     
-    
+    def check_traffic_recovery(self, current_time: float, recovery_start_time: float) -> bool:
+        """
+        Check if traffic has recovered to near-baseline conditions
+        
+        Args:
+            current_time: Current simulation time
+            recovery_start_time: Time when recovery check started
+            
+        Returns:
+            True if traffic has recovered, False otherwise
+        """
+        # Must wait minimum recovery window
+        if current_time - recovery_start_time < config.recovery_detection_window:
+            return False
+        
+        # Check all detectors for recovery
+        for det_edge in config.detector_edges:
+            try:
+                current_speed = traci.edge.getLastStepMeanSpeed(det_edge)
+                current_occupancy = traci.edge.getLastStepOccupancy(det_edge)
+                
+                # Get baseline (or use fallback)
+                baseline_speed = self.baseline_speeds.get(det_edge, config.speed_limit_ms * 0.9)
+                baseline_occupancy = self.baseline_occupancies.get(det_edge, 0.1)
+                
+                # Check if recovered
+                speed_recovered = current_speed >= (baseline_speed * config.recovery_speed_threshold)
+                occupancy_recovered = current_occupancy <= (baseline_occupancy + config.recovery_occupancy_threshold)
+                
+                # If any detector hasn't recovered, return False
+                if not (speed_recovered and occupancy_recovered):
+                    return False
+                    
+            except traci.exceptions.TraCIException:
+                continue
+        
+        # All detectors recovered
+        return True
+
     def run_scenario(self,
                 flow_total: int,
                 onramp_flow: int,
@@ -436,7 +503,7 @@ class SUMOSimulator:
                 scenario_id: int,
                 total_scenarios: int) -> Optional[pd.DataFrame]:
         """
-        Run a complete scenario
+        Run a complete scenario with realistic steady-state and full incident lifecycle
         
         Args:
             flow_total: TOTAL mainline traffic flow (veh/hour, both lanes)
@@ -465,12 +532,25 @@ class SUMOSimulator:
             # Start simulation with unique port for multiprocessing
             self.start_simulation(route_file, scenario_id)
             
+            # Reset state variables
+            self.logging_active = False
+            self.first_vehicle_completed = False
+            self.baseline_speeds = {}
+            self.baseline_occupancies = {}
+            
             # Incident tracking
             incident_injected = False
             incident_vehicle = None
             incident_info = None
             incident_time = None
             incident_lane = random.choice(config.incident_lane_distribution)
+            incident_cleared_naturally = False
+            incident_vehicle_left_map = False
+            recovery_check_start_time = None
+            
+            # Track vehicles that have completed the route
+            completed_vehicles = set()
+            all_spawned_vehicles = set()
             
             if has_incident:
                 # Randomize incident timing
@@ -486,38 +566,67 @@ class SUMOSimulator:
                 else:
                     incident_clear_time = None
             
-            # Calculate minimum simulation time before checking for early termination
-            # If we have on-ramp flow, we need to wait for warmup + buffer to let vehicles populate
-            onramp_buffer = 60.0 if onramp_flow > 0 else 0.0
-            min_simulation_time = config.warmup_time + onramp_buffer
-            
             # Simulation loop
             last_log_time = 0.0
             last_print_time = 0.0
+            steady_state_achieved_time = None
             
-            while traci.simulation.getMinExpectedNumber() > 0:
+            while True:
                 traci.simulationStep()
                 self.current_step += 1
                 current_time = traci.simulation.getTime()
                 
+                # Hard timeout check
+                if current_time > config.max_simulation_time:
+                    if config.debug_mode:
+                        print(f"\n  ⏱️ Hard timeout reached at {current_time:.1f}s")
+                    break
+                
+                # Track all vehicles
+                current_vehicles = set(traci.vehicle.getIDList())
+                all_spawned_vehicles.update(current_vehicles)
+                
+                # Detect vehicles that completed route (left the simulation)
+                newly_completed = all_spawned_vehicles - current_vehicles - completed_vehicles
+                completed_vehicles.update(newly_completed)
+                
+                # Check if first vehicle completed
+                if not self.first_vehicle_completed and len(completed_vehicles) > 0:
+                    self.first_vehicle_completed = True
+                    steady_state_achieved_time = current_time + config.steady_state_buffer_time
+                    if config.debug_mode:
+                        print(f"\n  ✅ First vehicle completed route at t={current_time:.1f}s")
+                        print(f"     Logging will begin at t={steady_state_achieved_time:.1f}s")
+                
+                # Activate logging once steady state is achieved
+                if (not self.logging_active and 
+                    self.first_vehicle_completed and 
+                    steady_state_achieved_time and 
+                    current_time >= steady_state_achieved_time):
+                    self.logging_active = True
+                    if config.debug_mode:
+                        print(f"\n  📊 Logging activated at t={current_time:.1f}s")
+                
                 # Print timestep updates
                 if (config.show_timestep_updates and 
                     current_time - last_print_time >= config.timestep_update_interval):
-                    num_vehicles = len(traci.vehicle.getIDList())
-                    print(f"  t={current_time:.1f}s, vehicles={num_vehicles}", end='\r')
+                    num_vehicles = len(current_vehicles)
+                    log_status = "LOGGING" if self.logging_active else "PRE-LOG"
+                    print(f"  t={current_time:.1f}s, vehicles={num_vehicles}, {log_status}", end='\r')
                     last_print_time = current_time
                 
-                # Inject incident if needed
-                if has_incident and not incident_injected and current_time >= incident_time:
+                # Inject incident if needed (only after logging is active)
+                if (has_incident and not incident_injected and 
+                    self.logging_active and current_time >= incident_time):
                     incident_vehicle, incident_info = self.inject_incident(
                         incident_position, incident_lane, current_time
                     )
                     if incident_vehicle:
                         incident_injected = True
                 
-                # Clear incident if needed
-                if (incident_injected and incident_clear_time and 
-                    current_time >= incident_clear_time):
+                # Clear incident if needed (natural recovery)
+                if (incident_injected and not incident_cleared_naturally and 
+                    incident_clear_time and current_time >= incident_clear_time):
                     if incident_vehicle in traci.vehicle.getIDList():
                         # Release speed control
                         traci.vehicle.setSpeed(incident_vehicle, -1)
@@ -537,40 +646,89 @@ class SUMOSimulator:
                             except:
                                 pass
                         
+                        incident_cleared_naturally = True
+                        recovery_check_start_time = current_time
+                        
                         if config.show_incident_details and (self.gui_mode or config.debug_mode):
                             print(f"\n{'='*60}")
-                            print(f"✅ INCIDENT CLEARED")
+                            print(f"✅ INCIDENT CLEARED NATURALLY")
                             print(f"{'='*60}")
                             print(f"  Time:        {current_time:.1f}s")
                             print(f"  Duration:    {current_time - incident_info['time']:.1f}s")
                             print(f"{'='*60}\n")
-                    incident_clear_time = None
                 
-                # Log data at specified frequency
-                if current_time - last_log_time >= config.log_frequency:
-                    data_point = self.collect_detector_data()
+                # Check if incident vehicle left the map
+                if (incident_injected and not incident_vehicle_left_map and 
+                    incident_vehicle not in current_vehicles):
+                    incident_vehicle_left_map = True
+                    recovery_check_start_time = current_time
+                    if config.debug_mode:
+                        print(f"\n  🚗 Incident vehicle left map at t={current_time:.1f}s")
+                
+                # Collect detector data (update baselines during pre-incident steady state)
+                update_baseline = (self.logging_active and not incident_injected)
+                data_point = self.collect_detector_data(update_baseline=update_baseline)
+                
+                # Log data only if logging is active and at specified frequency
+                if self.logging_active and current_time - last_log_time >= config.log_frequency:
                     data_point['scenario_id'] = scenario_id - 1  # Store 0-indexed
                     data_point['flow_total'] = flow_total
                     data_point['onramp_flow'] = onramp_flow
                     data_point['speed_factor_mean'] = speed_factor_mean
                     data_point['has_incident'] = 1 if has_incident else 0
                     data_point['incident_position'] = incident_position if has_incident else 0
-                    data_point['incident_active'] = 1 if (incident_injected and 
-                                                        (incident_clear_time is None or 
-                                                        current_time < incident_clear_time)) else 0
+                    # Only mark incident as inactive after vehicle leaves AND recovery begins
+                    incident_still_affecting_traffic = (incident_injected and 
+                                                    not incident_vehicle_left_map and
+                                                    not incident_cleared_naturally)
+
+                    # If vehicle just left or cleared naturally, check if we're still in recovery window
+                    if incident_vehicle_left_map or incident_cleared_naturally:
+                        if recovery_check_start_time:
+                            time_since_recovery_started = current_time - recovery_check_start_time
+                            # Keep marking as incident for first 100 seconds after vehicle leaves (shock wave propagation)
+                            incident_still_affecting_traffic = time_since_recovery_started < 100.0
+
+                    data_point['incident_active'] = 1 if incident_still_affecting_traffic else 0
                     
                     self.log_data.append(data_point)
                     last_log_time = current_time
                 
-                # Check if we should end - FIXED EARLY TERMINATION
-                total_vehicles = len(traci.vehicle.getIDList())
-                non_incident_vehicles = total_vehicles - (1 if incident_injected and incident_vehicle in traci.vehicle.getIDList() else 0)
+                # Determine if simulation should end
+                should_end = False
                 
-                # Only check for early termination after minimum simulation time
-                if (current_time > min_simulation_time and 
-                    non_incident_vehicles < config.min_vehicles_to_end):
+                # No vehicles left at all
+                if len(current_vehicles) == 0 and len(all_spawned_vehicles) > 0:
+                    should_end = True
                     if config.debug_mode:
-                        print(f"\n  Ending simulation: only {non_incident_vehicles} non-incident vehicles left")
+                        print(f"\n  🏁 All vehicles cleared at t={current_time:.1f}s")
+                
+                # For incident scenarios: incident vehicle left AND traffic recovered
+                elif (has_incident and incident_injected and 
+                      incident_vehicle_left_map and recovery_check_start_time):
+                    if self.check_traffic_recovery(current_time, recovery_check_start_time):
+                        should_end = True
+                        if config.debug_mode:
+                            print(f"\n  ✅ Traffic recovered at t={current_time:.1f}s")
+                
+                # For incident scenarios: naturally cleared AND traffic recovered
+                elif (has_incident and incident_injected and 
+                      incident_cleared_naturally and recovery_check_start_time):
+                    if self.check_traffic_recovery(current_time, recovery_check_start_time):
+                        should_end = True
+                        if config.debug_mode:
+                            print(f"\n  ✅ Traffic recovered after natural clearing at t={current_time:.1f}s")
+                
+                # For no-incident scenarios: reasonable amount of data collected
+                elif (not has_incident and self.logging_active and 
+                      len(self.log_data) >= 120):  # At least 2 minutes of logged data
+                    # Check if most vehicles have cleared
+                    if len(current_vehicles) < 5:
+                        should_end = True
+                        if config.debug_mode:
+                            print(f"\n  ✅ Baseline scenario complete at t={current_time:.1f}s")
+                
+                if should_end:
                     break
             
             # Clear the timestep line
@@ -586,8 +744,15 @@ class SUMOSimulator:
                 route_file.unlink()
             
             # Convert to DataFrame
+            if len(self.log_data) == 0:
+                print(f"  ⚠️ Warning: No data logged for scenario {scenario_id}")
+                return None
+            
             df = pd.DataFrame(self.log_data)
             self.log_data = []
+            
+            if config.debug_mode:
+                print(f"  📊 Logged {len(df)} data points ({df['sim_time'].min():.1f}s to {df['sim_time'].max():.1f}s)")
             
             return df
         
@@ -768,7 +933,7 @@ def run_single_simulation(flow_total: int = 2400,
                          onramp_flow: int = 1000,
                          speed_factor_mean: float = 1.0,
                          has_incident: bool = True,
-                         incident_position: float = 800):
+                         incident_position: float = 1900):
     """
     Run a single scenario in GUI mode for debugging
     
@@ -824,7 +989,7 @@ if __name__ == "__main__":
     # ============================================================================
     # EDIT THIS LINE TO SWITCH MODES
     # ============================================================================
-    MODE = "batch"  # Change to "batch" for full run, "test" for first 10 scenarios
+    MODE = "single"  # Change to "batch" for full run, "test" for first 10 scenarios
     # ============================================================================
     
     if MODE == "single":
