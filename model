@@ -78,6 +78,33 @@ class FeatureEngineer:
         
         return result
     
+    def create_time_lagged_features(self, df: pd.DataFrame, max_lag: int = 2) -> pd.DataFrame:
+        """
+        Create time-lagged features for temporal context
+        Captures actual historical values, not just rates of change
+        
+        Args:
+            df: DataFrame with detector data
+            max_lag: Maximum number of lags to create (default 2)
+        
+        Returns:
+            DataFrame with added lag features
+        """
+        result = df.copy()
+        
+        # Features to lag
+        features_to_lag = ['speed_mean', 'occupancy']
+        
+        for det_edge in config.detector_edges:
+            for feature in features_to_lag:
+                col_name = f'{det_edge}_{feature}'
+                
+                # Create lags (t-1, t-2, ...)
+                for lag in range(1, max_lag + 1):
+                    result[f'{col_name}_lag{lag}'] = df[col_name].shift(lag)
+        
+        return result
+
     def create_advanced_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Create advanced domain-specific features for incident detection"""
         result = df.copy()
@@ -123,7 +150,7 @@ class FeatureEngineer:
         print("🔧 Engineering features...")
         
         scenario_dfs = []
-        
+                
         for scenario_id in tqdm(df['scenario_id'].unique(), desc="Processing scenarios"):
             scenario_df = df[df['scenario_id'] == scenario_id].copy()
             
@@ -131,7 +158,12 @@ class FeatureEngineer:
             scenario_df = self.create_rolling_features(scenario_df, config.feature_window_long)
             scenario_df = self.create_spatial_derivatives(scenario_df)
             scenario_df = self.create_temporal_derivatives(scenario_df)
+            scenario_df = self.create_time_lagged_features(scenario_df, max_lag=2)  # Add lags
             scenario_df = self.create_advanced_features(scenario_df)
+            
+            # CRITICAL: Drop rows with NaN values from lagged features
+            # This prevents: (1) scenario boundary leakage, (2) early-scenario bias, (3) inconsistent RF training
+            scenario_df = scenario_df.dropna().reset_index(drop=True)
             
             scenario_dfs.append(scenario_df)
         
@@ -405,7 +437,7 @@ class AIDModel:
         refined_grid['min_samples_leaf'] = [max(1, min_leaf-1), min_leaf, min_leaf+1]
         
         refined_grid['max_features'] = [best_params['max_features']]
-        refined_grid['class_weight'] = [best_params['class_weight']]
+        refined_grid['class_weight'] = [best_params.get('class_weight', None)]
         
         return refined_grid
     
@@ -486,7 +518,7 @@ class AIDModel:
                 min_samples_split=self.best_params['min_samples_split'],
                 min_samples_leaf=self.best_params['min_samples_leaf'],
                 max_features=self.best_params['max_features'],
-                class_weight=self.best_params['class_weight'],
+                class_weight=self.best_params.get('class_weight', None),
                 random_state=config.random_state,
                 n_jobs=1 # Critical
             ),
@@ -667,8 +699,28 @@ class AIDModel:
         }
         
         diagnostic_file = config.results_dir / "diagnostic_report.json"
+
+        # Convert numpy types to Python native types for JSON serialization
+        def convert_to_python(obj):
+            """Convert numpy types to Python native types for JSON serialization"""
+            if isinstance(obj, np.bool_):
+                return bool(obj)
+            elif isinstance(obj, (np.integer, np.int8, np.int16, np.int32, np.int64)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float16, np.float32, np.float64)):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            elif isinstance(obj, dict):
+                return {key: convert_to_python(value) for key, value in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_to_python(item) for item in obj]
+            else:
+                return obj
+        diagnostic_report_python = convert_to_python(diagnostic_report)
+
         with open(diagnostic_file, 'w') as f:
-            json.dump(diagnostic_report, f, indent=2)
+            json.dump(diagnostic_report_python, f, indent=2)
         print(f"\n💾 Full diagnostic report saved to {diagnostic_file}")
         
         # Restore warnings
