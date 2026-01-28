@@ -200,8 +200,18 @@ class AIDModel:
         self.test_score = None
         self.decision_threshold = None
     
-    def prepare_data(self, df: pd.DataFrame, engineer_features: bool = True):
-        """Prepare data for training/testing"""
+    def prepare_data(self, df: pd.DataFrame, engineer_features: bool = True, return_full_df: bool = False):
+        """Prepare data for training/testing
+        
+        Args:
+            df: Input dataframe
+            engineer_features: Whether to apply feature engineering
+            return_full_df: If True, returns (X, y, full_df) instead of just (X, y)
+        
+        Returns:
+            If return_full_df=False: (X, y)
+            If return_full_df=True: (X, y, full_engineered_df)
+        """
         if engineer_features:
             df = self.feature_engineer.engineer_features(df)
         
@@ -211,7 +221,10 @@ class AIDModel:
         X = df[self.feature_columns]
         y = df['incident_active']
         
-        return X, y
+        if return_full_df:
+            return X, y, df
+        else:
+            return X, y
     
     def train(self, train_df: pd.DataFrame, val_df: pd.DataFrame, refine_with_grid: bool = False):
         """Train Random Forest with hyperparameter tuning"""
@@ -222,7 +235,7 @@ class AIDModel:
         # Prepare data (feature engineering still happens in Pandas)
         print("📊 Preparing training data...")
         X_train_df, y_train_df = self.prepare_data(train_df, engineer_features=True)
-        X_val_df, y_val_df = self.prepare_data(val_df, engineer_features=True)
+        X_val_df, y_val_df, val_df_engineered = self.prepare_data(val_df, engineer_features=True, return_full_df=True)
 
         # Convert to NumPy float32 before .fit() to save RAM
         print("Converting to Numpy float32")
@@ -358,20 +371,19 @@ class AIDModel:
         y_train_pred = self.model.predict(X_train)
         self.train_score = f1_score(y_train, y_train_pred)
         
-        print(f"\n{'='*60}")
-        print(f"✅ TRAINING COMPLETE")
-        print(f"{'='*60}")
-        print(f"  Total time: {self.training_time/60:.1f} minutes ({self.training_time/3600:.2f} hours)")
-        print(f"FINAL TRAINED THRESHOLD: {self.decision_threshold}")
-        print(f"Model THRESHOLD:", getattr(self.model, "decision_threshold", None))
-        
         # Validation performance
         print(f"\n{'='*60}")
         print(f"📊 VALIDATION SET PERFORMANCE")
         print(f"{'='*60}")
-        y_val_proba = self.model.predict_proba(X_val)[:,1] # Validation probabilities
-        self.select_decision_threshold(X_val, y_val) # Learn threshold from validation set
+        y_val_proba = self.model.predict_proba(X_val)[:,1]
+        self.select_decision_threshold(X_val, y_val)
         self.model.decision_threshold = self.decision_threshold
+
+        print(f"\n{'='*60}")
+        print(f"✅ TRAINING COMPLETE")
+        print(f"{'='*60}")
+        print(f"  Total time: {self.training_time/60:.1f} minutes ({self.training_time/3600:.2f} hours)")
+        print(f"  Decision threshold: {self.decision_threshold:.4f}")
         y_val_pred = (y_val_proba >= self.decision_threshold).astype(int) # Apply threshold
         val_accuracy = accuracy_score(y_val, y_val_pred)
         val_precision = precision_score(y_val, y_val_pred, zero_division=0)
@@ -385,7 +397,7 @@ class AIDModel:
         print(f"  (Validation is used during training for model selection)")
 
         self.evaluate_per_scenario(
-            val_df.reset_index(drop=True),
+            val_df_engineered,
             y_val_pred,
             y_val_proba
         )
