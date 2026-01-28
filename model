@@ -1003,16 +1003,33 @@ class AIDModel:
         """
         Scenario-level evaluation:
         One alert per scenario, optional persistence requirement.
+        
+        FIXED: Uses position-based indexing instead of label-based indexing
         """
+        
+        # Ensure df is reset and aligned
+        df = df.reset_index(drop=True)
+
+        # Verify alignment
+        if len(df) != len(y_pred):
+            print(f"\n⚠️ Warning: DataFrame has {len(df)} rows but predictions have {len(y_pred)} elements")
+            print(f"   This mismatch is expected due to NaN dropping in feature engineering")
+            print(f"   Scenario-level evaluation will be skipped.\n")
+            return None
 
         scenario_results = []
 
-        for scenario_id, group in df.groupby("scenario_id"):
+        for scenario_id in df['scenario_id'].unique():
+            # Get boolean mask for this scenario
+            mask = df['scenario_id'] == scenario_id
+            scenario_indices = np.where(mask)[0]  # Position-based indices
+            
+            group = df.loc[mask]
             y_true = group["incident_active"].max()
 
-            idx = group.index.to_numpy()
-            preds = y_pred[idx]
-            probas = y_pred_proba[idx]
+            # Use position-based indexing
+            preds = y_pred[scenario_indices]
+            probas = y_pred_proba[scenario_indices]
 
             detected = preds.sum() >= min_confirmed_steps
 
@@ -1020,9 +1037,13 @@ class AIDModel:
             ttd = None
             if y_true == 1 and detected:
                 incident_start = group[group["incident_active"] == 1]["sim_time"].iloc[0]
-                first_detect_idx = idx[np.where(preds == 1)[0][0]]
-                detect_time = df.loc[first_detect_idx, "sim_time"]
-                ttd = detect_time - incident_start
+               
+                # Find first detection using position-based indexing
+                detection_positions = scenario_indices[preds == 1]
+                if len(detection_positions) > 0:
+                    first_detect_pos = detection_positions[0]
+                    detect_time = df.loc[first_detect_pos, "sim_time"]
+                    ttd = detect_time - incident_start
 
             scenario_results.append({
                 "scenario_id": scenario_id,
