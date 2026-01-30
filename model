@@ -745,7 +745,7 @@ class AIDModel:
         print("="*60)
         print("(This is unseen data - the true measure of model performance)\n")
         
-        X_test, y_test = self.prepare_data(test_df, engineer_features=True)
+        X_test, y_test, test_df_engineered = self.prepare_data(test_df, engineer_features=True, return_full_df=True)
         
         print(f"Test set: {len(X_test):,} samples ({y_test.sum():,} incidents)\n")
         
@@ -883,6 +883,18 @@ class AIDModel:
 
         self.test_score = f1_score(y_test, y_pred)
         print("Threshold used:", self.decision_threshold)
+
+        X_test, y_test, test_df_engineered = self.prepare_data(test_df, engineer_features=True, return_full_df=True)
+    
+        print(f"\n{'='*60}")
+        print("📊 TEST SET SCENARIO-LEVEL PERFORMANCE")
+        print("="*60)
+        self.evaluate_per_scenario(
+            test_df_engineered,
+            y_pred,
+            y_pred_proba
+        )
+
         return results
     
     def _plot_confusion_matrix(self, cm):
