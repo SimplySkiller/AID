@@ -95,12 +95,9 @@ class SUMOSimulator:
         # Define mainline route (straight through highway)
         mainline_route = ET.SubElement(root, "route", 
                                     id="mainline",
-                                    edges="before_det1 det1 before_det2.1 before_det2.2 before_det2.3 det2 before_det3 det3 after_det3")
+                                    edges="before_det1 det1 before_det2 det2 before_det3 det3 after_det3")
         
-        # Define on-ramp route (merges onto highway)
-        onramp_route = ET.SubElement(root, "route",
-                                    id="onramp_route",
-                                    edges="onramp before_det2.2 before_det2.3 det2 before_det3 det3 after_det3")
+        
         
         # Calculate base insertion intervals (seconds per vehicle)
         mainline_interval = 3600.0 / flow_total if flow_total > 0 else float('inf')
@@ -160,42 +157,7 @@ class SUMOSimulator:
         else:
             mainline_veh_id = 0
         
-        # Generate on-ramp vehicles (if onramp_flow > 0)
-        if onramp_flow > 0:
-            onramp_time = 0.0  # Start on-ramp at the same time as mainline
-            onramp_veh_id = 0
-            
-            while onramp_time < max_time:
-                # On-ramp vehicles use on-ramp specific speed distribution
-                speed_factor = np.random.normal(
-                    config.speed_factor_onramp_mean,
-                    config.speed_factor_onramp_std
-                )
                 
-                # Clip to realistic range
-                speed_factor = np.clip(speed_factor,
-                                    config.speed_factor_clip_min,
-                                    config.speed_factor_clip_max)
-                
-                # Store vehicle data
-                all_vehicles.append({
-                    'depart': onramp_time,
-                    'id': f"onramp_{onramp_veh_id}",
-                    'type': 'car',
-                    'route': 'onramp_route',
-                    'departSpeed': 'max',
-                    'speedFactor': f"{speed_factor:.3f}"
-                })
-                
-                onramp_veh_id += 1
-                
-                # Add jittered interval
-                jitter = random.uniform(config.insertion_jitter_min,
-                                    config.insertion_jitter_max)
-                onramp_time += onramp_interval * jitter
-        else:
-            onramp_veh_id = 0
-        
         # CRITICAL: Sort all vehicles by depart time!
         all_vehicles.sort(key=lambda v: v['depart'])
         
@@ -224,7 +186,7 @@ class SUMOSimulator:
         self.temp_files.append(output_file)
         
         # DEBUG OUTPUT - Always print this to see what was generated
-        print(f"  Generated {mainline_veh_id} mainline + {onramp_veh_id} onramp vehicles")
+        print(f"  Generated {mainline_veh_id} mainline vehicles")
         print(f"  Vehicles sorted by depart time: first at {all_vehicles[0]['depart']:.2f}s, last at {all_vehicles[-1]['depart']:.2f}s")
     
     
@@ -261,12 +223,12 @@ class SUMOSimulator:
     
     
     def inject_incident(self, 
-                       position: float,
-                       lane: int,
-                       current_time: float,
-                       clear_after: Optional[float] = None) -> Optional[Tuple[str, Dict]]:
+                   position: float,
+                   lane: int,
+                   current_time: float) -> Optional[Tuple[str, Dict]]:
         """
-        Inject an incident by slowing down a vehicle
+        Inject an incident by stopping a vehicle completely (0 km/h)
+        Vehicle will stop for 15-30 minutes then recover to original speed
         
         Args:
             position: Position along highway (meters)
@@ -291,37 +253,26 @@ class SUMOSimulator:
                 veh_pos = traci.vehicle.getLanePosition(veh_id)
                 
                 # Calculate absolute position
-                # Calculate absolute position (offsets account for extended before_det1)
+                # Calculate absolute position (no on-ramp, simplified network)
                 if veh_edge == "before_det1":
                     abs_pos = veh_pos  # Starts at 0
                 elif veh_edge == "det1":
-                    abs_pos = 1595 + veh_pos  # Starts at 1595m
-                elif veh_edge == "before_det2.1":
-                    abs_pos = 1605 + veh_pos  # Starts at 1605m
-                elif veh_edge == "before_det2.2":
-                    abs_pos = 1640 + veh_pos  # Starts at 1640m (after 35m of before_det2.1)
-                elif veh_edge == "before_det2.3":
-                    abs_pos = 1901 + veh_pos  # Starts at 1901m (after 253m merge + 8m junction)
+                    abs_pos = 1495 + veh_pos  # Starts at 1495m
+                elif veh_edge == "before_det2":
+                    abs_pos = 1505 + veh_pos  # Starts at 1505m
                 elif veh_edge == "det2":
-                    abs_pos = 2092 + veh_pos  # Starts at 2092m
+                    abs_pos = 1995 + veh_pos  # Starts at 1995m
                 elif veh_edge == "before_det3":
-                    abs_pos = 2102 + veh_pos  # Starts at 2102m
+                    abs_pos = 2005 + veh_pos  # Starts at 2005m
                 elif veh_edge == "det3":
-                    abs_pos = 2592 + veh_pos  # Starts at 2592m
+                    abs_pos = 2495 + veh_pos  # Starts at 2495m
                 elif veh_edge == "after_det3":
-                    abs_pos = 2602 + veh_pos  # Starts at 2602m
+                    abs_pos = 2505 + veh_pos  # Starts at 2505m
                 else:
                     continue
                 
-                # Check if in correct lane and close to target
-                # Note: before_det2.2 has 3 lanes (0=onramp, 1=mainline right, 2=mainline left)
-                # We need to map our 2-lane system to this 3-lane section
-                if veh_edge == "before_det2.2":
-                    target_veh_lane = lane + 1  # Shift because lane 0 is onramp
-                else:
-                    target_veh_lane = lane
-                
-                if veh_lane == target_veh_lane:
+                # Check if in correct lane and close to target (simple 2-lane system throughout)
+                if veh_lane == lane:
                     distance = abs(abs_pos - position)
                     if distance < min_distance:
                         min_distance = distance
@@ -337,11 +288,11 @@ class SUMOSimulator:
             current_speed_kmh = current_speed * 3.6
             veh_edge = traci.vehicle.getRoadID(best_vehicle)
             
-            # Calculate incident speed
-            incident_speed = current_speed * config.incident_severity
-            incident_speed_kmh = incident_speed * 3.6
+            # STOP VEHICLE COMPLETELY (0 km/h)
+            incident_speed = 0.0
+            incident_speed_kmh = 0.0
             
-            # Set speed immediately
+            # Set speed to 0 immediately
             traci.vehicle.setSpeed(best_vehicle, incident_speed)
             
             # CRITICAL: Disable lane changing to keep incident in intended lane
@@ -375,8 +326,9 @@ class SUMOSimulator:
                 'lane': lane,
                 'edge': veh_edge,
                 'speed_before_kmh': current_speed_kmh,
+                'speed_before_ms': current_speed,  # Store for recovery
                 'speed_after_kmh': incident_speed_kmh,
-                'severity': config.incident_severity
+                'severity': 1.0  # Complete stop
             }
             
             # Print detailed incident information
@@ -557,14 +509,9 @@ class SUMOSimulator:
                 incident_time = random.uniform(config.incident_start_time_min,
                                             config.incident_start_time_max)
                 
-                # Determine if incident will clear
-                will_clear = random.random() < config.incident_clearing_probability
-                if will_clear:
-                    clear_duration = random.uniform(config.incident_clearing_duration_min,
-                                                config.incident_clearing_duration_max)
-                    incident_clear_time = incident_time + clear_duration
-                else:
-                    incident_clear_time = None
+                # ALL INCIDENTS NOW RECOVER after 15-30 minutes of being stopped
+                recovery_duration = random.uniform(900, 1800)  # 15-30 minutes in seconds
+                incident_clear_time = incident_time + recovery_duration
             
             # Simulation loop
             last_log_time = 0.0
@@ -624,12 +571,13 @@ class SUMOSimulator:
                     if incident_vehicle:
                         incident_injected = True
                 
-                # Clear incident if needed (natural recovery)
+                # Recover incident vehicle after stop duration
                 if (incident_injected and not incident_cleared_naturally and 
                     incident_clear_time and current_time >= incident_clear_time):
                     if incident_vehicle in traci.vehicle.getIDList():
-                        # Release speed control
-                        traci.vehicle.setSpeed(incident_vehicle, -1)
+                        # Restore original speed
+                        original_speed = incident_info['speed_before_ms']
+                        traci.vehicle.setSpeed(incident_vehicle, original_speed)
                         
                         # Re-enable lane changing
                         traci.vehicle.setLaneChangeMode(incident_vehicle, 597)
@@ -677,19 +625,12 @@ class SUMOSimulator:
                     data_point['speed_factor_mean'] = speed_factor_mean
                     data_point['has_incident'] = 1 if has_incident else 0
                     data_point['incident_position'] = incident_position if has_incident else 0
-                    # Only mark incident as inactive after vehicle leaves AND recovery begins
-                    incident_still_affecting_traffic = (incident_injected and 
-                                                    not incident_vehicle_left_map and
-                                                    not incident_cleared_naturally)
+                    # Incident is active ONLY while vehicle is stopped (not recovered, not left map)
+                    incident_still_active = (incident_injected and 
+                                            not incident_cleared_naturally and
+                                            not incident_vehicle_left_map)
 
-                    # If vehicle just left or cleared naturally, check if we're still in recovery window
-                    if incident_vehicle_left_map or incident_cleared_naturally:
-                        if recovery_check_start_time:
-                            time_since_recovery_started = current_time - recovery_check_start_time
-                            # Keep marking as incident for first 100 seconds after vehicle leaves (shock wave propagation)
-                            incident_still_affecting_traffic = time_since_recovery_started < 100.0
-
-                    data_point['incident_active'] = 1 if incident_still_affecting_traffic else 0
+                    data_point['incident_active'] = 1 if incident_still_active else 0
                     
                     self.log_data.append(data_point)
                     last_log_time = current_time
@@ -719,14 +660,15 @@ class SUMOSimulator:
                         if config.debug_mode:
                             print(f"\n  ✅ Traffic recovered after natural clearing at t={current_time:.1f}s")
                 
-                # For no-incident scenarios: reasonable amount of data collected
-                elif (not has_incident and self.logging_active and 
-                      len(self.log_data) >= 120):  # At least 2 minutes of logged data
-                    # Check if most vehicles have cleared
-                    if len(current_vehicles) < 5:
+                # For no-incident scenarios: collect 5 minutes of steady-state data then end
+                elif (not has_incident and self.logging_active):
+                    time_since_logging_started = current_time - steady_state_achieved_time
+                    # End after 1650 steps of logged data (avg of 15-30min incident + 300 beffer for it to return to normal= equal data points)
+                    if time_since_logging_started >= 1650:
                         should_end = True
+                        print(f"\n  ✅ Non-incident complete: {time_since_logging_started:.0f}s logged")
                         if config.debug_mode:
-                            print(f"\n  ✅ Baseline scenario complete at t={current_time:.1f}s")
+                            print(f"\n  ✅ Non-incident scenario complete at t={current_time:.1f}s (collected {time_since_logging_started:.0f}s of data)")
                 
                 if should_end:
                     break
@@ -737,11 +679,23 @@ class SUMOSimulator:
             
             # Close simulation
             traci.close()
-            time.sleep(0.2)
+            time.sleep(0.5)
             
-            # Clean up temp route file
+            # Clean up temp route file with retry logic (Windows file locking)
             if route_file.exists():
-                route_file.unlink()
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        route_file.unlink()
+                        break  # Success, exit retry loop
+                    except PermissionError:
+                        if attempt < max_retries - 1:
+                            time.sleep(0.5)  # Wait and retry
+                        else:
+                            # Final attempt failed, but this is non-critical
+                            # File will be overwritten on next run anyway
+                            if config.debug_mode:
+                                print(f"  ⚠️ Could not delete temp file (in use): {route_file.name}")
             
             # Convert to DataFrame
             if len(self.log_data) == 0:
@@ -758,6 +712,8 @@ class SUMOSimulator:
         
         except Exception as e:
             print(f"\n  ❌ Error in scenario {scenario_id}: {e}")
+            import traceback
+            traceback.print_exc()
             try:
                 if traci.isLoaded():
                     traci.close()
@@ -800,7 +756,8 @@ def run_batch_simulations(start_idx: int = 0, end_idx: Optional[int] = None, use
         print(f"Using {config.num_workers} parallel workers")
     print("="*60 + "\n")
     
-    # Calculate total number of scenarios (needed because no incident would get multiplied by incident positions)
+    # Calculate total number of scenarios
+    # FIX: Non-incidents now run 4x (once per incident position) to balance classes
     temp_total = 0
     for has_incident in [False, True]:
         for flow in range(config.flow_min, config.flow_max + 1, config.flow_step):
@@ -814,10 +771,9 @@ def run_batch_simulations(start_idx: int = 0, end_idx: Optional[int] = None, use
                 for speed_factor in np.arange(config.speed_factor_min, 
                                             config.speed_factor_max + 0.01, 
                                             config.speed_factor_step):
-                    # Optimization: 1 pass for baseline, multiple for incidents
-                    current_positions = config.incident_positions if has_incident else [None]
-                    for _ in current_positions:
-                        temp_total += 1
+                    # Both incident and non-incident run len(incident_positions) times
+                    num_runs = len(config.incident_positions)
+                    temp_total += num_runs
 
     config.total_scenarios = temp_total
     # Generate all scenario combinations
@@ -830,9 +786,16 @@ def run_batch_simulations(start_idx: int = 0, end_idx: Optional[int] = None, use
                 if has_incident and (flow > 2400 or onramp > 1000):
                     continue
                 for speed_factor in np.arange(config.speed_factor_min, 
-                                              config.speed_factor_max + 0.01, 
-                                              config.speed_factor_step):
-                    current_positions = config.incident_positions if has_incident else [None]
+                                            config.speed_factor_max + 0.01, 
+                                            config.speed_factor_step):
+                    # FIX CLASS IMBALANCE: Run non-incident scenarios multiple times
+                    # This balances the dataset (4 incident positions = 4 non-incident runs)
+                    if has_incident:
+                        current_positions = config.incident_positions
+                    else:
+                        # Run non-incident scenarios 4 times (matches incident position count)
+                        current_positions = [None]# * len(config.incident_positions)
+                    
                     for incident_pos in current_positions:
                         scenarios.append({
                             'scenario_id': scenario_id + 1,
@@ -840,15 +803,24 @@ def run_batch_simulations(start_idx: int = 0, end_idx: Optional[int] = None, use
                             'onramp_flow': onramp,
                             'speed_factor_mean': round(speed_factor, 1),
                             'has_incident': has_incident,
-                            'incident_position': incident_pos,
+                            'incident_position': incident_pos if has_incident else 0,
                             'total_scenarios': config.total_scenarios
                         })
                         scenario_id += 1
     
+   
     # Filter scenarios by index
     if end_idx is None:
         end_idx = len(scenarios)
     scenarios = scenarios[start_idx:end_idx]
+
+    # Update total_scenarios to reflect the subset being run
+    actual_total = len(scenarios)
+    # Update total_scenarios in each scenario dict to reflect subset
+    actual_total = len(scenarios)
+    for scenario in scenarios:
+        scenario['total_scenarios'] = actual_total
+    print(f"Running scenarios {start_idx+1} to {end_idx} ({actual_total} total)\n")
     
     print(f"Running scenarios {start_idx+1} to {end_idx} ({len(scenarios)} total)\n")
     
@@ -929,11 +901,11 @@ def run_batch_simulations(start_idx: int = 0, end_idx: Optional[int] = None, use
             print(f"  ❌ {name:5s} file ERROR: {e}")
 
 
-def run_single_simulation(flow_total: int = 2400,
-                         onramp_flow: int = 1000,
+def run_single_simulation(flow_total: int = 9800,
+                         onramp_flow: int = 800,
                          speed_factor_mean: float = 1.0,
-                         has_incident: bool = True,
-                         incident_position: float = 1900):
+                         has_incident: bool = False,
+                         incident_position: float = 2250):
     """
     Run a single scenario in GUI mode for debugging
     
@@ -989,7 +961,7 @@ if __name__ == "__main__":
     # ============================================================================
     # EDIT THIS LINE TO SWITCH MODES
     # ============================================================================
-    MODE = "single"  # Change to "batch" for full run, "test" for first 10 scenarios
+    MODE = "batch"  # Change to "batch" for full run, "test" for first 10 scenarios
     # ============================================================================
     
     if MODE == "single":
