@@ -10,7 +10,7 @@ from pathlib import Path
 # ============================================================================
 # PATHS
 # ============================================================================
-base_dir = Path(r"C:\Users\Bence\Desktop\BME\MSC\Thesis\Code3.1")
+base_dir = Path(r"C:\Users\Bence\Desktop\BME\MSC\Thesis\Code4")
 sumo_net_file = base_dir / "highway.net.xml"
 sumo_cfg_file = base_dir / "highway.sumocfg"
 vtypes_file = base_dir / "vehicle_types.add.xml"
@@ -42,15 +42,15 @@ min_incident_observation_time = 120  # Minimum time to observe incident effects 
 first_vehicle_must_complete = True  # Wait for first vehicle to complete route before logging
 steady_state_buffer_time = 30  # Extra time after first vehicle completes (seconds)
 max_simulation_time = 12000  # Hard limit: 200 minutes (3.3 hours) max per scenario (seconds) - allows slow incident vehicles to traverse full 2.5km network
-recovery_detection_window = 60  # Time window to check for recovery (seconds)
-recovery_speed_threshold = 0.85  # Speed must recover to 85% of baseline to consider "recovered"
-recovery_occupancy_threshold = 0.15  # Occupancy must drop below 15% to consider "recovered"
+recovery_detection_window = 300  # Time window to check for recovery (seconds) - 5 minutes to allow jam dissipation
+recovery_speed_threshold = 0.90  # Speed must recover to 85% of baseline to consider "recovered"
+recovery_occupancy_threshold = 0.10  # Occupancy must drop below 15% to consider "recovered"
 
 # ============================================================================
 # NETWORK PARAMETERS
 # ============================================================================
 detector_edges = ["det1", "det2", "det3"]  # 50m detector zones
-detector_positions = [1600, 2097, 2597]  # Detector midpoints after extending before_det1 to 1595m      # Approximate positions (meters)
+detector_positions = [1500, 2000, 2500]  # Detector midpoints: det1, det2, det3
 speed_limit_ms = 36.11  # 130 km/h in m/s
 speed_limit_kmh = 130   # For reference
 network_length = 2000   # meters
@@ -62,14 +62,14 @@ onramp_merge_position = 540  # meters - where onramp merges (at J9)
 # ============================================================================
 # Traffic flow range (TOTAL vehicles/hour for BOTH lanes combined on MAINLINE)
 # Changed to 200-step increments for faster scenario generation
-flow_min = 250   # Total mainline flow (both lanes) - very sparse traffic
-flow_max = 3450  # Total mainline flow (both lanes) - heavy but not gridlock
-flow_step = 200  # Step 200 gives: 200, 400, 600, ..., 2400 (12 values)
+flow_min = 200   # Total mainline flow (both lanes) - very sparse traffic
+flow_max = 8800  # Total mainline flow (both lanes) - heavy but not gridlock
+flow_step = 50  # Step 200 gives: 200, 400, 600, ..., 2400 (12 values)
 
-# On-ramp flow range (vehicles/hour, single lane)
-onramp_flow_min = 50    # No on-ramp traffic
-onramp_flow_max = 1450  # Heavy on-ramp traffic
-onramp_flow_step = 200 # Step 200 gives: 0, 200, 400, 600, 800 (5 values)
+# On-ramp flow (removed - network simplified to mainline only)
+onramp_flow_min = 0
+onramp_flow_max = 0
+onramp_flow_step = 1  # Single value (0)
 
 # Speed factor range (multiplier of speed limit)
 # Min: 60 km/h (legal minimum in Hungary) = 0.46 speed factor
@@ -82,12 +82,17 @@ speed_factor_step = 0.1
 # Incident position iteration
 # Baseline: 4 positions for good coverage without excessive scenarios
 # Incident positions (absolute meters from network start)
-# All positions are on before_det1 (0-1595m) or between detectors
-incident_positions = [400, 800, 1200, 1700]  # Spread across: before det1, between det1-det2, between det2-det3
+# New positions: halfway between det2-det3, 125m closer to det3, on det3, 125m after det3
+incident_positions = [2250, 2375, 2500, 2625]
+# Breakdown:
+# 2250m = halfway between det2 (2000m) and det3 (2500m) - on before_det3
+# 2375m = 125m closer to det3 from midpoint - on before_det3
+# 2500m = on det3 detector itself
+# 2625m = 125m after det3 - on after_det3
 
 # Calculate total scenarios
 num_mainline_flows = int((flow_max - flow_min) / flow_step) + 1  # 12 flows (200-2400 step 200)
-num_onramp_flows = int((onramp_flow_max - onramp_flow_min) / onramp_flow_step) + 1  # 5 flows (0-800 step 200)
+num_onramp_flows = 1  # No on-ramp variation
 num_speed_factors = int((speed_factor_max - speed_factor_min) / speed_factor_step) + 1  # 7
 num_incident_positions = len(incident_positions)  # 4
 
@@ -141,7 +146,7 @@ incident_start_time_max = 50  # Latest: 50s (enough variation without wasting ti
 incident_severity = 0.01  # Vehicle slows to 1% of original speed
 
 # Incident duration behavior
-incident_clearing_probability = 0.3  # 30% of incidents clear
+incident_clearing_probability = 1  # 30% of incidents clear # taken out to reduce scope for now
 incident_clearing_duration_min = 180  # Clear after 3 minutes (seconds)
 incident_clearing_duration_max = 300  # Clear after 5 minutes (seconds)
 
@@ -174,19 +179,19 @@ spatial_derivative_features = [
 # ============================================================================
 # Hyperparameter search - using RandomizedSearchCV for speed
 # Grid search would take 5-10x longer with minimal improvement
-n_iter_search = 50  # Number of parameter combinations to try (was full grid)
+n_iter_search = 25  # Number of parameter combinations to try (was full grid)
 
 rf_param_distributions = {
-    'n_estimators': [200, 300, 400],
+    'n_estimators': [200, 300],
     'max_depth': [20, 30, None],
-    'min_samples_split': [2, 5, 10, 15],
-    'min_samples_leaf': [1, 2, 4],
-    'max_features': ['sqrt'],
-    'class_weight': ['balanced']
+    'min_samples_split': [2, 5, 10],
+    'min_samples_leaf': [1, 2],
+    'max_features': ['sqrt']#,
+    #'class_weight': ['balanced']
 }
 
 # Cross-validation
-cv_folds = 5
+cv_folds = 3
 random_state = 42
 
 # ============================================================================
@@ -235,5 +240,5 @@ print(f"✅ Config loaded: {total_scenarios} total simulations planned")
 print(f"   Base scenarios: {base_scenarios} (incident y/n × mainline flow × onramp flow × speed factor)")
 print(f"   Incident positions: {num_incident_positions} → Total: {total_scenarios}")
 print(f"   Mainline flow range: {flow_min}-{flow_max} veh/h TOTAL ({flow_min//2}-{flow_max//2} per lane)")
-print(f"   On-ramp flow range: {onramp_flow_min}-{onramp_flow_max} veh/h")
+print(f"   On-ramp: Removed (simplified network)")
 print(f"   Speed factors: {speed_factor_min}-{speed_factor_max} ({speed_factor_min*speed_limit_kmh:.0f}-{speed_factor_max*speed_limit_kmh:.0f} km/h)")
