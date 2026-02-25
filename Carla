@@ -1,0 +1,100 @@
+import sys
+import os
+import subprocess
+import queue
+import time
+
+# --- ENVIRONMENT ---
+egg_file_path = 'C:/carla_source/carla/PythonAPI/carla/dist/carla-0.9.10-py3.8-win-amd64.egg'
+if os.path.exists(egg_file_path):
+    sys.path.append(egg_file_path)
+
+try:
+    import carla
+except ImportError:
+    sys.exit("FATAL: Could not import carla.")
+
+BASE_PATH = r"C:\Users\36302\Desktop\Thesis\I"
+SUMO_CFG = os.path.join(BASE_PATH, "highway.sumocfg")
+SYNC_SCRIPT = r"C:\carla_source\carla\Co-Simulation\Sumo\run_synchronization.py"
+PYTHON_EXE = sys.executable
+
+def main():
+    client = carla.Client('localhost', 2000)
+    client.set_timeout(30.0) 
+    world = client.get_world()
+
+    settings = world.get_settings()
+    settings.synchronous_mode = True
+    settings.fixed_delta_seconds = 0.5 
+    world.apply_settings(settings)
+
+    weather = carla.WeatherParameters()
+    weather.sun_altitude_angle = -15.0 
+    weather.cloudiness = 0.0
+    world.set_weather(weather)
+
+    cam_bp = world.get_blueprint_library().find('sensor.camera.rgb')
+    
+    # --- RESOLUTION & ZOOM ---
+    cam_bp.set_attribute('image_size_x', '700') 
+    cam_bp.set_attribute('image_size_y', '1200')
+    
+    # Field of View: Lower = More Zoom. Default is 90. 
+    # 60 will significantly reduce the sides and "zoom in" the center.
+    cam_bp.set_attribute('fov', '80') 
+    
+    cam_bp.set_attribute('enable_postprocess_effects', 'True')
+    cam_bp.set_attribute('exposure_mode', 'manual')
+    cam_bp.set_attribute('exposure_compensation', '1.0') 
+    cam_bp.set_attribute('shutter_speed', '200') 
+    cam_bp.set_attribute('iso', '400') 
+    cam_bp.set_attribute('gamma', '2.2') 
+
+    # --- TILT & POSITION ---
+    # Pitch changed to -25.0 to point further down (hiding the sky/top of frame)
+    cam_transform = carla.Transform(
+        carla.Location(x=-500.0, y=7.85, z=7.0), 
+        carla.Rotation(pitch=-17.5, yaw=180.0, roll=0.0) 
+    )
+    camera = world.spawn_actor(cam_bp, cam_transform)
+    
+    image_queue = queue.Queue()
+    camera.listen(image_queue.put)
+    
+    out_path = os.path.join(BASE_PATH, 'out')
+    if not os.path.exists(out_path): os.makedirs(out_path)
+
+    subprocess.Popen([PYTHON_EXE, SYNC_SCRIPT, SUMO_CFG, '--step-length', '0.5'], 
+                     cwd=os.path.dirname(SYNC_SCRIPT))
+
+    try:
+        time.sleep(3)
+        while True:
+            world.tick()
+            
+            vehicles = world.get_actors().filter('vehicle.*')
+            for v in vehicles:
+                v.set_light_state(carla.VehicleLightState.NONE)
+                if any(x in v.type_id.lower() for x in ['cola', 't2', 'isetta']):
+                    v.set_location(carla.Location(z=-100))
+
+            while image_queue.qsize() > 1:
+                image_queue.get_nowait()
+
+            try:
+                image = image_queue.get(timeout=5.0)
+                image.save_to_disk(os.path.join(out_path, '%06d.png' % image.frame))
+            except queue.Empty:
+                continue
+
+    except Exception as e:
+        print(f"\nStopped: {e}")
+    finally:
+        settings.synchronous_mode = False
+        world.apply_settings(settings)
+        camera.destroy()
+        print("Done.")
+
+if __name__ == '__main__':
+    main()
