@@ -1,0 +1,981 @@
+#!/usr/bin/env python3
+"""
+carla_capture.py  –  Merged SUMO + CARLA AID Dataset Generator
+================================================================
+Single script that runs SUMO traffic simulation AND captures CARLA
+camera images around incident events.
+
+How it relates to simulation.py
+---------------------------------
+This script IMPORTS SUMOSimulator from simulation.py so all SUMO logic
+(route generation, incident injection, detector logging, recovery detection)
+is identical to the standalone SUMO pipeline.  Nothing is reimplemented.
+
+What this script adds
+----------------------
+• CarlaManager  – headless CARLA process, camera, vehicle actor pool
+• AIDScenarioRunner – wraps SUMOSimulator and hooks CARLA capture into
+  the simulation loop at the right moments
+• CSV output with per-frame metadata (scenario_id, sim_time, label, ...)
+  ready to join against the SUMO macro data in train/val/test HDF5 files
+
+Label design (no post-recovery ambiguity)
+------------------------------------------
+  label = 0  →  PRE-incident frames (PRE_INCIDENT_WINDOW seconds before injection)
+  label = 1  →  incident ACTIVE (vehicle stopped)
+  Scenario camera capture STOPS at incident_clear_time.
+
+  Residual traffic jam frames (vehicle recovered but queue still present)
+  are intentionally excluded.  Including them with label=0 would teach the
+  CNN that "queue = normal", which harms precision.
+
+Merging with SUMO macro data
+------------------------------
+  Join key:  scenario_id  +  sim_time
+  For the 30-second history window, select SUMO detector rows where:
+      scenario_id == frame.scenario_id  AND
+      sim_time    IN [frame.sim_time - 30, frame.sim_time]
+
+CNN recommendation
+------------------
+  EfficientNet-B0  (best accuracy/FLOPs ratio for 384x640, ImageNet pretrain)
+  ResNet-18        (simpler, easier Grad-CAM, slightly lower accuracy)
+  Avoid MobileNetV3 unless deploying on embedded hardware.
+
+Usage
+-----
+  python carla_capture.py                # run all incident scenarios
+  python carla_capture.py --dry-run      # SUMO only, no CARLA (fast validation)
+  python carla_capture.py --limit 1      # run first scenario only
+  python carla_capture.py --split-only   # rebuild train/val/test CSVs only
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import xml.etree.ElementTree as ET
+import os
+import queue
+import random
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+# ============================================================================
+# Project paths  (must come before importing simulation / config)
+# ============================================================================
+_PROJECT = Path(r"C:\Users\36302\Desktop\Thesis\I")
+sys.path.insert(0, str(_PROJECT))
+
+import config as cfg          # noqa: E402
+import traci                  # noqa: E402  (same traci used by simulation.py)
+
+# Import the proven SUMOSimulator - all SUMO logic lives there.
+# This means route generation and incident injection are byte-for-byte
+# identical to the standalone simulation.py pipeline.
+from simulation import SUMOSimulator  # noqa: E402
+
+# ============================================================================
+# CARLA egg
+# ============================================================================
+_CARLA_EGG = r"C:\carla_source\carla\PythonAPI\carla\dist\carla-0.9.10-py3.8-win-amd64.egg"
+if os.path.exists(_CARLA_EGG):
+    sys.path.insert(0, _CARLA_EGG)
+else:
+    sys.exit(f"FATAL: CARLA egg not found at:\n  {_CARLA_EGG}\n"
+             "Update _CARLA_EGG at the top of carla_capture.py.")
+
+# ============================================================================
+# Tuneable constants
+# ============================================================================
+
+# Executables & files
+# ── CARLA launch config (source build via UE4Editor) ──────────────────────────
+# UE4Editor.exe from your Epic Games installation (UE 4.24 for CARLA 0.9.10)
+UE4_EDITOR_EXE  = r"C:\UE4_24\Engine\Binaries\Win64\UE4Editor.exe"
+CARLA_UPROJECT  = r"C:\carla_source\carla\Unreal\CarlaUE4\CarlaUE4.uproject"
+# Packaged build (3GB, Highway1 map only) - much faster startup than UE4Editor
+CARLA_PACKAGED_EXE  = r"C:\carla_source\carla\Build\UE4Carla\0.9.10-dirty\WindowsNoEditor\CarlaUE4.exe"
+USE_PACKAGED_BUILD  = True   # use the packaged build (set False to fall back to UE4Editor)
+# Map name as it appears in the packaged build.
+# In Unreal, the map asset is the .umap filename without extension.
+# If load_world() fails, open CARLA, run:
+#   python -c "import carla; c=carla.Client('localhost',2000); print(c.get_available_maps())"
+# and use the last segment of the path shown (e.g. '/Game/Maps/Highway1' -> 'Highway1').
+CARLA_MAP_NAME = "Highway1"
+
+# CARLA connection
+CARLA_HOST         = "localhost"
+CARLA_PORT         = 2000
+CARLA_BOOT_TIMEOUT = 120   # seconds; packaged build is usually ready in 20-40s
+
+# Output
+DATASET_DIR = _PROJECT / "dataset"
+DATASET_DIR.mkdir(parents=True, exist_ok=True)
+
+# Capture window
+PRE_INCIDENT_WINDOW = 30.0   # seconds of normal traffic to capture before incident
+# Post-incident window = 0 by design: capture ends exactly at incident_clear_time
+
+# Image capture rate
+CAPTURE_FPS      = 2.0
+CAPTURE_INTERVAL = 1.0 / CAPTURE_FPS   # 0.5 s
+
+# Camera config  - DO NOT CHANGE (from working training_simulator.py)
+CAM_IMAGE_X       = 384
+CAM_IMAGE_Y       = 640
+CAM_FOV           = 25
+CAM_EXPOSURE_MODE = "manual"
+CAM_EXPOSURE_COMP = 0.1
+CAM_ISO           = 50
+CAM_GAMMA         = 4
+CAM_SHUTTER       = 1
+CAM_LOCATION      = {"x": 1500.0, "y": 7.85, "z": 7.0}  # netedit x=2500 -> CARLA x=1500
+# How far AHEAD of the camera (in SUMO x direction) to mirror vehicles into CARLA.
+# Camera yaw=180 looks toward lower x (vehicles approaching from netedit start).
+# Only vehicles in the range [cam_x - VEHICLE_SYNC_RADIUS, cam_x] are synced.
+# Vehicles behind the camera (higher x, already passed) are never synced.
+# FOV=25 at z=7m covers ~100-150m depth; 200m gives margin for fast-approaching cars.
+VEHICLE_SYNC_RADIUS = 200.0  # metres ahead of camera
+CAM_ROTATION      = {"pitch": -22, "yaw": 180.0, "roll": 0.0}
+
+# SUMO <-> CARLA coordinate system
+#
+#   highway.net.xml netOffset = "1000, 3.20" means:
+#     Netedit display:   x =    0 ... 3000   (what you see in netedit / config positions)
+#     SUMO internal:     x = -1000 ... 2000  (what TraCI getPosition() returns)
+#     CARLA world:       x = -1000 ... 2000  (same range as SUMO internal)
+#
+#   Conversion: SUMO_internal = netedit_x - 1000
+#               CARLA_x       = SUMO_internal  (no extra offset needed)
+#
+#   Examples:
+#     Netedit x=0    -> SUMO/CARLA x = -1000  (network start)
+#     Netedit x=2500 -> SUMO/CARLA x =  1500  (det3 / camera position)
+#     Netedit x=3000 -> SUMO/CARLA x =  2000  (network end)
+#
+#   incident_positions in config.py: use NETEDIT coords (e.g. 2500).
+#   CAM_LOCATION: use CARLA/SUMO-internal coords (netedit - 1000).
+COORD_OFFSET_X = 0.0   # no offset: SUMO internal == CARLA world
+COORD_OFFSET_Y = 0.0
+SPAWN_Z        = 0.5   # metres above road surface
+
+# Vehicle blueprints used for SUMO->CARLA actor mirroring
+VEHICLE_BLUEPRINTS = [
+    "vehicle.audi.a2",
+    "vehicle.lincoln.mkz2017",
+    "vehicle.tesla.model3",
+    "vehicle.volkswagen.t2",
+]
+
+
+# ============================================================================
+# Route file lane-index fix
+# ============================================================================
+
+def _fix_depart_lanes(route_file: Path) -> None:
+    """
+    Remap departLane indices in a generated route file to match the actual
+    driving lanes in this highway network.
+
+    Network lane layout (5 lanes per edge):
+        0  shoulder  - no passenger vehicles allowed
+        1  driving   - right / slow lane
+        2  driving   - left  / fast lane
+        3  shoulder
+        4  shoulder
+
+    generate_route_file() produces departLane="0" and departLane="1"
+    based on config.lane0_preference / lane1_preference.
+    Lane 0 is a shoulder -> SUMO rejects the vehicle at load time.
+
+    Remap:  "0" -> "1"   (right driving lane)
+            "1" -> "2"   (left  driving lane)
+    """
+    LANE_MAP = {"0": "1", "1": "2"}
+
+    tree = ET.parse(str(route_file))
+    root = tree.getroot()
+    changed = 0
+    for veh in root.iter("vehicle"):
+        dl = veh.get("departLane")
+        if dl in LANE_MAP:
+            veh.set("departLane", LANE_MAP[dl])
+            changed += 1
+    tree.write(str(route_file), encoding="utf-8", xml_declaration=True)
+    print(f"  [lane-fix] remapped departLane for {changed} vehicles (0->1, 1->2)")
+
+
+# ============================================================================
+# CARLA Manager
+# ============================================================================
+
+class CarlaManager:
+    """
+    Manages the CARLA process, world, camera, and mirrored vehicle actors.
+
+    Lifecycle
+    ---------
+    start()         - launches headless CarlaUE4.exe, loads OpenDRIVE map,
+                      configures sync mode, spawns camera.
+    tick()          - advances CARLA one synchronous step (every SUMO step
+                      during the capture window).
+    capture_image() - saves the latest rendered frame to disk.
+    stop()          - destroys actors, restores async mode, kills process.
+
+    Vehicle mirroring
+    -----------------
+    sync_vehicles() reconciles the actor pool with the current SUMO snapshot.
+    Physics is disabled on all actors; positions are driven by SUMO.
+    """
+
+    def __init__(self) -> None:
+        self._process:     Optional[subprocess.Popen] = None
+        self._client       = None
+        self._world        = None
+        self._camera       = None
+        self._bp_lib       = None
+        self._image_queue: queue.Queue = queue.Queue()
+        self._actor_pool:  Dict[str, object] = {}
+        self._carla        = None
+
+    # ---- Lifecycle -----------------------------------------------------------
+
+    def start(self) -> None:
+        try:
+            import carla as _carla
+        except ImportError:
+            sys.exit(
+                "FATAL: 'carla' package not importable.\n"
+                f"Check that the egg exists at:\n  {_CARLA_EGG}"
+            )
+        self._carla = _carla
+
+        # ── Step 1: connect to an already-running CARLA, or launch one ────────
+        #
+        # Strategy: try to connect first (fast path for manual launch or
+        # re-use across scenarios).  Only spawn a new process if port is closed.
+        #
+        self._client = _carla.Client(CARLA_HOST, CARLA_PORT)
+        self._client.set_timeout(5.0)
+        already_running = False
+        try:
+            self._client.get_server_version()
+            already_running = True
+            print(f"[CARLA] Found running server on port {CARLA_PORT} – skipping launch.")
+        except Exception:
+            pass
+
+        if already_running:
+            pass
+        else:
+            # Launch the packaged build (or fall back to UE4Editor)
+            if USE_PACKAGED_BUILD:
+                if not os.path.exists(CARLA_PACKAGED_EXE):
+                    raise FileNotFoundError(
+                        f"Packaged CARLA not found:\n  {CARLA_PACKAGED_EXE}\n"
+                        "Update CARLA_PACKAGED_EXE at the top of this file."
+                    )
+                launch_cmd = [
+                    CARLA_PACKAGED_EXE,
+                    "-RenderOffScreen",
+                    f"-carla-port={CARLA_PORT}",
+                    "-quality-level=Low",
+                    "-benchmark",
+                    "-fps=2",   # match capture rate - no point rendering faster than we capture
+                ]
+                print("[CARLA] Launching packaged CarlaUE4.exe headless ...")
+            else:
+                if not os.path.exists(UE4_EDITOR_EXE):
+                    raise FileNotFoundError(
+                        f"UE4Editor not found:\n  {UE4_EDITOR_EXE}\n"
+                        "Update UE4_EDITOR_EXE at the top of this file."
+                    )
+                if not os.path.exists(CARLA_UPROJECT):
+                    raise FileNotFoundError(
+                        f"CarlaUE4.uproject not found:\n  {CARLA_UPROJECT}\n"
+                        "Update CARLA_UPROJECT at the top of this file."
+                    )
+                launch_cmd = [
+                    UE4_EDITOR_EXE, CARLA_UPROJECT,
+                    "-RenderOffScreen", "-nullrhi",
+                    f"-carla-port={CARLA_PORT}",
+                    "-quality-level=Low",
+                    "-nosplash", "-noSound", "-unattended", "-nopause",
+                ]
+                print("[CARLA] Launching source-build via UE4Editor ...")
+                print(f"        (first launch ~5-10 min for shader compilation)")
+
+            self._process = subprocess.Popen(
+                launch_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            # Poll until the server accepts connections
+            self._client.set_timeout(5.0)
+            print(f"[CARLA] Waiting for server (up to {CARLA_BOOT_TIMEOUT}s) ...")
+            deadline  = time.time() + CARLA_BOOT_TIMEOUT
+            connected = False
+            while time.time() < deadline:
+                try:
+                    self._client.get_server_version()
+                    connected = True
+                    break
+                except Exception:
+                    time.sleep(3.0)
+
+            if not connected:
+                self._process.kill()
+                raise RuntimeError(
+                    f"CARLA did not respond within {CARLA_BOOT_TIMEOUT}s.\n"
+                    "Try launching CarlaUE4.exe manually first, then re-run the script.\n"
+                    f"Expected exe: {CARLA_PACKAGED_EXE if USE_PACKAGED_BUILD else UE4_EDITOR_EXE}"
+                )
+
+        # In CARLA 0.9.10, client.set_timeout() controls how long world.tick()
+        # will wait for a rendered frame before raising RuntimeError.
+        # 30s is conservative for a GPU under heavy load.
+        self._client.set_timeout(30.0)
+        print(f"[CARLA] Server ready (v{self._client.get_server_version()}).")
+        self._load_map()
+        self._set_synchronous(True)
+        self._spawn_camera()
+
+    def stop(self) -> None:
+        print("[CARLA] Shutting down ...")
+        self._teardown_camera()
+        self._destroy_all_actors()
+        if self._world is not None:
+            try:
+                self._set_synchronous(False)
+            except Exception:
+                pass
+        if self._process is not None:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+        self._world  = None
+        self._client = None
+        self._carla  = None
+        print("[CARLA] Stopped.")
+
+    # ---- Map -----------------------------------------------------------------
+
+    def _load_map(self) -> None:
+        # Use load_world() with the map that is already packaged into the build.
+        # generate_opendrive_world() is unreliable with packaged builds and
+        # loses all the Unreal assets (road surface, lighting, props) that
+        # make your images look realistic.
+        #
+        # CARLA_MAP_NAME must match the .umap filename inside the packaged build.
+        # To list available maps while CARLA is running:
+        #   python -c "import carla; c=carla.Client('localhost',2000); print(c.get_available_maps())"
+        # Use the last segment of any path shown (e.g. /Game/Maps/Highway1 -> Highway1).
+        print(f"[CARLA] Loading map '{CARLA_MAP_NAME}' ...")
+
+        # Check what maps are actually available and give a helpful error
+        available = self._client.get_available_maps()
+        # Match on the final segment of the path (case-insensitive)
+        matched = [m for m in available
+                   if m.split("/")[-1].lower() == CARLA_MAP_NAME.lower()]
+
+        if not matched:
+            segments = [m.split("/")[-1] for m in available]
+            raise RuntimeError(
+                f"Map '{CARLA_MAP_NAME}' not found in packaged build.\n"
+                f"Available maps: {segments}\n"
+                f"Update CARLA_MAP_NAME at the top of this file to one of the above."
+            )
+
+        self._world  = self._client.load_world(matched[0])
+        self._bp_lib = self._world.get_blueprint_library()
+        print(f"[CARLA] Map loaded: {matched[0]}")
+
+        # Set weather to exactly the tested working configuration.
+        # sun_altitude_angle=90 = overhead noon sun, no shadows.
+        weather = self._carla.WeatherParameters()
+        weather.sun_altitude_angle     = 90.0
+        weather.cloudiness             = 0.0
+        weather.sky_light_intensity    = 1.0
+        weather.indirect_light_intensity = 1.0
+        self._world.set_weather(weather)
+        print(f"[CARLA] Weather set: sun_altitude={weather.sun_altitude_angle}, "
+              f"cloudiness={weather.cloudiness}.")
+
+    def _set_synchronous(self, enabled: bool) -> None:
+        settings = self._world.get_settings()
+        settings.synchronous_mode    = enabled
+        settings.fixed_delta_seconds = cfg.sim_step_length if enabled else 0.0
+        self._world.apply_settings(settings)
+
+    # ---- Camera --------------------------------------------------------------
+
+    def _spawn_camera(self) -> None:
+        bp = self._bp_lib.find("sensor.camera.rgb")
+        bp.set_attribute("image_size_x",               str(CAM_IMAGE_X))
+        bp.set_attribute("image_size_y",               str(CAM_IMAGE_Y))
+        bp.set_attribute("fov",                        str(CAM_FOV))
+        bp.set_attribute("enable_postprocess_effects", "True")
+        bp.set_attribute("exposure_mode",              CAM_EXPOSURE_MODE)
+        bp.set_attribute("exposure_compensation",      str(CAM_EXPOSURE_COMP))
+        bp.set_attribute("iso",                        str(CAM_ISO))
+        bp.set_attribute("gamma",                      str(CAM_GAMMA))
+        bp.set_attribute("shutter_speed",              str(CAM_SHUTTER))
+
+        transform = self._carla.Transform(
+            self._carla.Location(**CAM_LOCATION),
+            self._carla.Rotation(**CAM_ROTATION),
+        )
+        self._camera = self._world.spawn_actor(bp, transform)
+        self._camera.listen(self._image_queue.put)
+        print(f"[CARLA] Camera spawned at {CAM_LOCATION}.")
+
+    def _teardown_camera(self) -> None:
+        if self._camera is not None:
+            try:
+                self._camera.stop()
+                self._camera.destroy()
+            except Exception:
+                pass
+            self._camera = None
+
+    # ---- Vehicle actor pool --------------------------------------------------
+
+    def sync_vehicles(
+        self,
+        vehicle_states: Dict[str, Tuple[float, float, float]],
+    ) -> None:
+        """
+        Reconcile CARLA actor pool with current SUMO vehicle snapshot.
+
+        Parameters
+        ----------
+        vehicle_states : {sumo_vid: (sumo_x, sumo_y, heading_deg)}
+        """
+        current_ids = set(vehicle_states)
+        pool_ids    = set(self._actor_pool)
+
+        for vid in pool_ids - current_ids:
+            try:
+                self._actor_pool[vid].destroy()
+            except Exception:
+                pass
+            del self._actor_pool[vid]
+
+        for vid, (sx, sy, heading) in vehicle_states.items():
+            cx, cy, cz = self._sumo_to_carla(sx, sy)
+            yaw        = self._sumo_heading_to_carla(heading)
+            transform  = self._carla.Transform(
+                self._carla.Location(x=cx, y=cy, z=cz),
+                self._carla.Rotation(yaw=yaw),
+            )
+            if vid in self._actor_pool:
+                self._actor_pool[vid].set_transform(transform)
+            else:
+                bp    = self._bp_lib.find(random.choice(VEHICLE_BLUEPRINTS))
+                actor = self._world.try_spawn_actor(bp, transform)
+                if actor is not None:
+                    actor.set_simulate_physics(False)
+                    self._actor_pool[vid] = actor
+
+    def _destroy_all_actors(self) -> None:
+        for actor in self._actor_pool.values():
+            try:
+                actor.destroy()
+            except Exception:
+                pass
+        self._actor_pool.clear()
+
+    # ---- Tick & capture ------------------------------------------------------
+
+    def tick(self) -> None:
+        self._world.tick()
+
+    def capture_image(self, out_path: Path) -> bool:
+        """
+        Save the latest queued image.  Drains the queue to avoid back-pressure.
+        Returns True if an image was saved.
+        """
+        latest = None
+        while not self._image_queue.empty():
+            try:
+                latest = self._image_queue.get_nowait()
+            except queue.Empty:
+                break
+        if latest is not None:
+            latest.save_to_disk(str(out_path), self._carla.ColorConverter.Raw)
+            return True
+        return False
+
+    # ---- Coordinate helpers --------------------------------------------------
+
+    @staticmethod
+    def _sumo_to_carla(sx: float, sy: float) -> Tuple[float, float, float]:
+        # SUMO: right-handed, y north.  CARLA/UE4: left-handed, y south.
+        cx = sx + COORD_OFFSET_X
+        cy = -(sy + COORD_OFFSET_Y)
+        return cx, cy, SPAWN_Z
+
+    @staticmethod
+    def _sumo_heading_to_carla(sumo_heading: float) -> float:
+        # SUMO 0 deg = North, CW.  CARLA yaw 0 deg = East, CCW.
+        return -(sumo_heading - 90.0)
+
+
+# ============================================================================
+# AID Scenario Runner
+# ============================================================================
+
+class AIDScenarioRunner:
+    """
+    Runs one incident scenario with SUMO (via imported SUMOSimulator) and
+    optionally CARLA image capture.
+
+    Phase 1  (SUMO only, no GPU):
+        t = 0  ->  capture_start  (= incident_start - PRE_INCIDENT_WINDOW)
+        SUMO steps at full speed.  CARLA is not launched yet.
+
+    Phase 2  (SUMO + CARLA):
+        t = capture_start  ->  incident_clear_time
+        CARLA renders each step; images saved at CAPTURE_FPS.
+        Incident vehicle injected at incident_start_time.
+        Scenario ends at incident_clear_time (clean label boundary).
+    """
+
+    def __init__(self, dry_run: bool = False) -> None:
+        self.dry_run = dry_run
+        self.sumo    = SUMOSimulator(gui_mode=False)
+
+    def run(
+        self,
+        scenario_id:       int,
+        flow_total:        int,
+        speed_factor_mean: float,
+        incident_position: float,
+    ) -> List[dict]:
+        """Run one incident scenario. Returns per-frame metadata rows."""
+
+        onramp_flow = 0
+
+        # Deterministic randomness per scenario (same seed logic as simulation.py)
+        random.seed(cfg.random_state + scenario_id)
+
+        # Incident timing - mirrors simulation.py exactly
+        t_lo = min(cfg.incident_start_time_min, cfg.incident_start_time_max)
+        t_hi = max(cfg.incident_start_time_min, cfg.incident_start_time_max)
+        incident_start     = random.uniform(t_lo, t_hi) if t_hi > t_lo else float(t_lo)
+        incident_lane      = random.choice(cfg.incident_lane_distribution)
+        recovery_duration  = random.uniform(900, 1800)
+        incident_clear_time = incident_start + recovery_duration
+
+        capture_start = max(0.0, incident_start - PRE_INCIDENT_WINDOW)
+        capture_end   = incident_clear_time
+
+        scen_label = f"s{scenario_id:05d}"
+        img_dir    = DATASET_DIR / scen_label / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+
+        # Skip already-completed scenarios so re-runs are safe.
+        # Delete the folder manually if you want to re-capture a scenario.
+        scen_csv = DATASET_DIR / scen_label / "metadata.csv"
+        if scen_csv.exists():
+            import csv as _csv
+            with open(scen_csv, newline="", encoding="utf-8") as fh:
+                existing_count = sum(1 for _ in _csv.DictReader(fh))
+            if existing_count > 0:
+                print(f"[SKIP] {scen_label} already has {existing_count} frames - skipping.")
+                return []
+
+        print(f"\n{'─'*60}")
+        print(f"[{scen_label}] flow={flow_total} veh/h  sf={speed_factor_mean:.2f}  "
+              f"pos={incident_position:.0f}m  lane={incident_lane}")
+        print(f"  Incident:  t={incident_start:.1f}s -> clear={incident_clear_time:.1f}s  "
+              f"(dur={recovery_duration:.0f}s)")
+        if self.dry_run:
+            print(f"  Capture:   dry-run (SUMO only)")
+        else:
+            est = int((capture_end - capture_start) * CAPTURE_FPS)
+            print(f"  Capture:   t={capture_start:.1f}s -> {capture_end:.1f}s  (~{est} frames)")
+        print(f"{'─'*60}")
+
+        # Route file - uses simulation.py's proven generator
+        route_file = cfg.base_dir / f"routes_temp_{scenario_id}.rou.xml"
+        self.sumo.generate_route_file(flow_total, onramp_flow, speed_factor_mean, route_file)
+
+        # Fix departLane indices for this network.
+        #
+        # Edges have 5 lanes: shoulder|driving|driving|shoulder|shoulder
+        #   index 0 = shoulder (no passenger vehicles allowed)
+        #   index 1 = right/slow driving lane
+        #   index 2 = left/fast  driving lane
+        #   index 3,4 = shoulders
+        #
+        # generate_route_file() emits departLane="0" and departLane="1"
+        # (from config.lane0_preference / lane1_preference = 60/40 split).
+        # Lane 0 is a shoulder so SUMO rejects it immediately.
+        #
+        # Fix: remap  0 -> 1  (right driving lane)
+        #             1 -> 2  (left  driving lane)
+        _fix_depart_lanes(route_file)
+
+        # incident_lane comes from config.incident_lane_distribution = [1, 2]
+        # which already maps to the correct driving lane indices in this network.
+        incident_lane_sumo = incident_lane
+
+        # Start SUMO - uses simulation.py's start_simulation (TraCI, proven working)
+        self.sumo.start_simulation(route_file, scenario_id)
+
+        # Reset SUMOSimulator state variables (same as simulation.py does internally)
+        self.sumo.logging_active          = False
+        self.sumo.first_vehicle_completed = False
+        self.sumo.baseline_speeds         = {}
+        self.sumo.baseline_occupancies    = {}
+        self.sumo.log_data                = []
+
+        # Local state
+        metadata_rows:            List[dict]  = []
+        frame_id                  = 0
+        last_capture_time         = -999.0
+        last_print_time           = -999.0
+        incident_injected         = False
+        incident_vehicle          = None
+        incident_injection_attempts = 0
+        completed_vehicles:       set = set()
+        all_spawned_vehicles:     set = set()
+        steady_state_achieved_time: Optional[float] = None
+        carla: Optional[CarlaManager] = None
+
+        try:
+            while True:
+                traci.simulationStep()
+                self.sumo.current_step += 1
+                t = traci.simulation.getTime()
+
+                # Hard timeout
+                if t > cfg.max_simulation_time:
+                    print(f"\n[SIM] Hard timeout at t={t:.1f}s")
+                    break
+
+                # Capture window end - clean label boundary
+                if t >= capture_end:
+                    print(f"\n[SIM] t={t:.1f}s - reached incident clearing, stopping.")
+                    break
+
+                # Vehicle tracking (mirrors simulation.py)
+                current_vehicles = set(traci.vehicle.getIDList())
+                all_spawned_vehicles.update(current_vehicles)
+                newly_completed  = all_spawned_vehicles - current_vehicles - completed_vehicles
+                completed_vehicles.update(newly_completed)
+
+                if not self.sumo.first_vehicle_completed and completed_vehicles:
+                    self.sumo.first_vehicle_completed  = True
+                    steady_state_achieved_time         = t + cfg.steady_state_buffer_time
+
+                if (not self.sumo.logging_active
+                        and self.sumo.first_vehicle_completed
+                        and steady_state_achieved_time is not None
+                        and t >= steady_state_achieved_time):
+                    self.sumo.logging_active = True
+
+                # Incident injection (after steady state, mirrors simulation.py)
+                if (not incident_injected
+                        and self.sumo.logging_active
+                        and t >= incident_start):
+                    result = self.sumo.inject_incident(incident_position, incident_lane_sumo, t)
+                    if result is not None:
+                        incident_vehicle, _ = result
+                        incident_injected   = True
+                    else:
+                        # No vehicle near position yet - retry next second
+                        incident_injection_attempts += 1
+                        incident_start += 1.0
+                        if incident_injection_attempts > 60 or incident_start > incident_clear_time - 60:
+                            print("[SIM] Could not inject incident after 60 attempts - skipping scenario.")
+                            break
+
+                # Launch CARLA when capture window opens
+                if carla is None and not self.dry_run and t >= capture_start:
+                    carla = CarlaManager()
+                    carla.start()
+
+                # CARLA tick + vehicle sync + image capture
+                # Only tick CARLA when a frame is actually due (every 0.5s at 2 FPS).
+                # Between capture intervals SUMO still steps freely at full speed.
+                # This is the biggest single performance win: 5x fewer render calls.
+                if carla is not None and t - last_capture_time >= CAPTURE_INTERVAL:
+
+                    # Only mirror vehicles AHEAD of the camera.
+                    # Camera yaw=180 means it looks in the -x direction (toward lower x).
+                    # Vehicles travel in +x direction (netedit 0->3000 = SUMO -1000->2000).
+                    # "Ahead" = vehicles not yet reached the camera = x < cam_sumo_x.
+                    # "Behind" = vehicles that passed = x > cam_sumo_x (not visible).
+                    # VEHICLE_SYNC_RADIUS caps how far ahead we look (camera FOV depth).
+                    cam_sumo_x = CAM_LOCATION["x"]
+                    vehicle_states = {}
+                    for vid in current_vehicles:
+                        vx, vy = traci.vehicle.getPosition(vid)
+                        dist_ahead = cam_sumo_x - vx   # positive = vehicle is ahead of camera
+                        if 0 <= dist_ahead <= VEHICLE_SYNC_RADIUS:
+                            vehicle_states[vid] = (vx, vy, traci.vehicle.getAngle(vid))
+
+                    carla.sync_vehicles(vehicle_states)
+                    carla.tick()
+
+                    label = 1 if incident_injected else 0
+                    fname = f"frame_{frame_id:06d}.png"
+                    saved = carla.capture_image(img_dir / fname)
+                    if saved:
+                        metadata_rows.append({
+                            "scenario_id":         scen_label,
+                            "sim_time":            round(t, 2),
+                            "frame_id":            frame_id,
+                            "filename":            fname,
+                            "incident_label":      label,
+                            "mainline_flow":       flow_total,
+                            "speed_factor":        speed_factor_mean,
+                            "incident_position":   incident_position,
+                            "incident_lane":       incident_lane,
+                            "incident_start_time": round(incident_start, 2),
+                            "incident_clear_time": round(incident_clear_time, 2),
+                        })
+                        frame_id        += 1
+                    last_capture_time = t
+
+                # Progress print for dry-run
+                elif self.dry_run and t - last_print_time >= 10.0:
+                    if t >= capture_start:
+                        status = "INCIDENT" if incident_injected else "PRE-INCIDENT"
+                    else:
+                        status = "FAST-FORWARD"
+                    print(f"  [dry-run] t={t:.1f}s  {status}  "
+                          f"vehicles={len(current_vehicles)}",
+                          end="\r")
+                    last_print_time = t
+
+        except KeyboardInterrupt:
+            print("\n[SIM] Interrupted.")
+        except Exception as exc:
+            print(f"\n[SIM] Error: {exc}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            if carla is not None:
+                # Don't fully stop CARLA between scenarios - just clean up actors.
+                # The process stays alive so the next scenario connects instantly.
+                # Full stop (carla.stop()) is called once in main() after all scenarios.
+                carla._destroy_all_actors()
+                carla._teardown_camera()
+                try:
+                    carla._set_synchronous(False)
+                except Exception:
+                    pass
+                # Keep self reference for potential re-use signal, but nullify world
+                # state so next scenario does a fresh map load + camera spawn.
+                carla = None
+            # Close TraCI and clean route file (mirrors simulation.py teardown)
+            try:
+                traci.close()
+                time.sleep(0.5)
+            except Exception:
+                pass
+            for _ in range(3):
+                try:
+                    if route_file.exists():
+                        route_file.unlink()
+                    break
+                except PermissionError:
+                    time.sleep(0.5)
+
+        # Write per-scenario CSV
+        if metadata_rows:
+            scen_csv   = DATASET_DIR / scen_label / "metadata.csv"
+            _write_csv(scen_csv, metadata_rows)
+            n_incident = sum(1 for r in metadata_rows if r["incident_label"] == 1)
+            n_normal   = len(metadata_rows) - n_incident
+            print(f"\n[OUT] {scen_label}: {len(metadata_rows)} frames  "
+                  f"({n_normal} normal / {n_incident} incident)  ->  {scen_csv}")
+        else:
+            print(f"\n[OUT] No frames captured for {scen_label}.")
+
+        return metadata_rows
+
+
+# ============================================================================
+# CSV helpers
+# ============================================================================
+
+MASTER_CSV = DATASET_DIR / "master_metadata.csv"
+
+
+def _write_csv(path: Path, rows: List[dict]) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _append_master_csv(rows: List[dict]) -> None:
+    if not rows:
+        return
+    needs_header = not MASTER_CSV.exists()
+    with open(MASTER_CSV, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+        if needs_header:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+# ============================================================================
+# Train / val / test split
+# ============================================================================
+
+def write_split_csvs() -> None:
+    """
+    Rebuild train/val/test split CSVs from master_metadata.csv.
+
+    Split is at the SCENARIO level so no scenario leaks across splits.
+    Ratios: cfg.train_ratio / val_ratio / test_ratio (default 70/15/15).
+
+    30-second history window note
+    ------------------------------
+    For each image row, select SUMO detector rows where:
+        scenario_id == row.scenario_id  AND
+        sim_time IN [row.sim_time - 30, row.sim_time]
+    """
+    if not MASTER_CSV.exists():
+        print("[SPLIT] master_metadata.csv not found - run scenarios first.")
+        return
+
+    with open(MASTER_CSV, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+
+    if not rows:
+        print("[SPLIT] master_metadata.csv is empty.")
+        return
+
+    scen_ids = sorted(set(r["scenario_id"] for r in rows))
+    rng      = random.Random(cfg.random_state)
+    rng.shuffle(scen_ids)
+
+    n       = len(scen_ids)
+    n_train = int(n * cfg.train_ratio)
+    n_val   = int(n * cfg.val_ratio)
+
+    train_ids = set(scen_ids[:n_train])
+    val_ids   = set(scen_ids[n_train:n_train + n_val])
+    test_ids  = set(scen_ids[n_train + n_val:])
+
+    for split_name, id_set in [("train", train_ids),
+                                ("val",   val_ids),
+                                ("test",  test_ids)]:
+        split_rows = [r for r in rows if r["scenario_id"] in id_set]
+        out        = DATASET_DIR / f"{split_name}_metadata.csv"
+        if split_rows:
+            _write_csv(out, split_rows)
+        n_scen = len(set(r["scenario_id"] for r in split_rows))
+        print(f"[SPLIT] {split_name:5s}: {len(split_rows):6d} frames  "
+              f"({n_scen} scenarios)  ->  {out}")
+
+
+# ============================================================================
+# Scenario enumeration (incident scenarios only)
+# ============================================================================
+
+def enumerate_scenarios() -> List[dict]:
+    """
+    Return the list of incident scenarios to run.
+
+    Only incident scenarios are enumerated - no-incident scenarios produce
+    SUMO macro data in simulation.py but have nothing for the camera to see.
+
+    The scenario_id here is a simple 0-based index.  It is stored in the CSV
+    as 's00000', 's00001', etc. and matches the SUMO macro data scenario_id
+    when you run simulation.py with the same config.
+    """
+    scenarios = []
+    sid       = 0
+
+    sf_values = [
+        round(cfg.speed_factor_min + i * cfg.speed_factor_step, 2)
+        for i in range(
+            int(round((cfg.speed_factor_max - cfg.speed_factor_min)
+                      / cfg.speed_factor_step)) + 1
+        )
+    ]
+
+    for flow in range(cfg.flow_min, cfg.flow_max + 1, cfg.flow_step):
+        for sf in sf_values:
+            for inc_pos in cfg.incident_positions:
+                scenarios.append(dict(
+                    scenario_id       = sid,
+                    flow_total        = flow,
+                    speed_factor_mean = sf,
+                    incident_position = float(inc_pos),
+                ))
+                sid += 1
+
+    print(f"[CONFIG] {len(scenarios)} incident scenarios enumerated.")
+    return scenarios
+
+
+# ============================================================================
+# Entry point
+# ============================================================================
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Merged SUMO + CARLA AID incident dataset generator."
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Run SUMO only, skip CARLA. Fast way to validate incident injection.",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="Stop after this many scenarios (e.g. --limit 1 for smoke test).",
+    )
+    parser.add_argument(
+        "--split-only", action="store_true",
+        help="Skip simulation; only rebuild train/val/test split CSVs.",
+    )
+    args = parser.parse_args()
+
+    if args.split_only:
+        write_split_csvs()
+        return
+
+    scenarios = enumerate_scenarios()
+    if args.limit:
+        scenarios = scenarios[: args.limit]
+
+    print(f"[MAIN] Running {len(scenarios)} scenario(s).  dry_run={args.dry_run}")
+    if not args.dry_run:
+        print()
+        print("[CARLA] Before running, start CARLA with this exact command:")
+        print(f"  {CARLA_PACKAGED_EXE}"
+              f" -quality-level=Low -benchmark -fps=2 -RenderOffScreen"
+              f" -carla-port={CARLA_PORT}")
+        print("  Wait until the map finishes loading (usually 20-40s), then this")
+        print("  script will detect it automatically on port 2000.")
+        print()
+
+    runner = AIDScenarioRunner(dry_run=args.dry_run)
+
+    for i, sc in enumerate(scenarios, start=1):
+        print(f"\n[MAIN] Scenario {i}/{len(scenarios)}")
+        rows = runner.run(**sc)
+        _append_master_csv(rows)
+
+    print(f"\n[MAIN] All done.  Dataset root: {DATASET_DIR}")
+    print(f"[MAIN] Rebuilding train/val/test split CSVs ...")
+    write_split_csvs()
+
+
+if __name__ == "__main__":
+    main()
