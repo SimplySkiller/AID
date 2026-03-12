@@ -1,0 +1,1118 @@
+"""
+cnn_model.py  –  CNN training and evaluation for AID image dataset
+==================================================================
+Trains a temporal EfficientNet-B0 on the CARLA-rendered highway camera images
+produced by carla_capture.py.
+
+Architecture
+------------
+  - EfficientNet-B0 backbone (ImageNet pretrained, torchvision)
+  - N frames uniformly sampled from each 60-frame (30s) sliding window
+  - Per-frame features (1280-d) averaged → temporal context vector
+  - MLP classification head: 1280 → 256 → 1 (binary)
+  - Two training phases:
+      Phase 1  – backbone frozen, head trained (fast convergence)
+      Phase 2  – last 2 MBConv blocks + head fine-tuned at lr/10
+
+Split alignment with SUMO Random Forest model
+----------------------------------------------
+  The SUMO macro-data split (train/val/test .h5) partitioned by scenario_id.
+  This script reads those same scenario_id sets and applies them to the image
+  metadata CSV so BOTH models are evaluated on exactly the same scenarios.
+  No scenario windows can leak across splits.
+
+Sliding window dataset
+-----------------------
+  - Window size  : 60 frames = 30 seconds at 2 FPS
+  - Stride       : 3 frames (1.5 seconds shift per sample)
+  - Frames/window: 8 frames sampled uniformly from each 60-frame window
+                   (reduces GPU memory; 8 frames still covers the full 30s)
+  - Label        : label of the LAST frame in the window
+                   (predicts current state given 30s of history)
+
+GPU notes (GTX 1060 3GB)
+-------------------------
+  - Images resized to 224×224 (EfficientNet-B0 native resolution)
+  - batch_size = 6 sequences × 8 frames = 48 CNN forward passes per step
+  - Backbone frozen in phase 1 → no activation storage → ~500 MB peak
+  - Fine-tuning phase 2 with gradient checkpointing to stay under 3 GB
+  - Falls back to CPU automatically if CUDA OOM
+
+Usage
+-----
+  python cnn_model.py                    # full training pipeline
+  python cnn_model.py --phase1-only      # freeze backbone only (fast, ~1h)
+  python cnn_model.py --evaluate-only    # load saved model, run test set
+  python cnn_model.py --hp-search        # try all hyperparameter combinations
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import gc
+import json
+import math
+import os
+import sys
+import time
+import warnings
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import matplotlib
+matplotlib.use("Agg")          # non-interactive backend (no display needed)
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+# ── PyTorch ──────────────────────────────────────────────────────────────────
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch.utils.data import DataLoader, Dataset
+    from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+    from torchvision import transforms
+    from torchvision.models import efficientnet_b0, EfficientNet_B0_Weights
+    from PIL import Image
+except ImportError as e:
+    sys.exit(
+        f"FATAL: PyTorch/torchvision not installed.\n  {e}\n"
+        "Install with:  pip install torch torchvision --index-url "
+        "https://download.pytorch.org/whl/cu117"
+    )
+
+# ── sklearn (for metrics, threshold search) ──────────────────────────────────
+from sklearn.metrics import (
+    accuracy_score, classification_report, confusion_matrix,
+    f1_score, precision_score, recall_score, roc_auc_score, roc_curve
+)
+
+# ── Project paths ─────────────────────────────────────────────────────────────
+_PROJECT = Path(r"C:\Users\36302\Desktop\Thesis\I")
+sys.path.insert(0, str(_PROJECT))
+
+import config as cfg  # noqa: E402
+
+# ── Output paths ──────────────────────────────────────────────────────────────
+DATASET_DIR  = _PROJECT / "dataset"
+MASTER_CSV   = DATASET_DIR / "master_metadata.csv"
+CNN_MODELS   = _PROJECT / "models" / "cnn"
+CNN_RESULTS  = _PROJECT / "results" / "cnn"
+CNN_MODELS.mkdir(parents=True, exist_ok=True)
+CNN_RESULTS.mkdir(parents=True, exist_ok=True)
+
+# ============================================================================
+# Hyperparameters (defaults — overridden during HP search)
+# ============================================================================
+
+WINDOW_SIZE      = 60      # frames in context window (30s at 2 FPS)
+N_FRAMES_WINDOW  = 8       # frames uniformly sampled from each window
+WINDOW_STRIDE    = 3       # window slides this many frames per sample
+IMAGE_SIZE       = 224     # resize images to IMAGE_SIZE × IMAGE_SIZE
+BATCH_SIZE       = 6       # sequences per gradient step
+NUM_EPOCHS       = 40      # max epochs (early stopping usually kicks in first)
+PHASE1_EPOCHS    = 10      # epochs with backbone frozen (phase 1)
+LR_HEAD          = 1e-3    # learning rate for head (phase 1)
+LR_FINETUNE      = 1e-4    # learning rate for fine-tuning (phase 2)
+DROPOUT          = 0.4     # dropout before final classifier
+EARLY_STOP_PAT   = 5       # stop if val loss doesn't improve for this many epochs
+WEIGHT_DECAY     = 1e-4    # L2 regularisation
+
+# Normalisation — ImageNet statistics (EfficientNet-B0 was pretrained on ImageNet)
+NORM_MEAN = [0.485, 0.456, 0.406]
+NORM_STD  = [0.229, 0.224, 0.225]
+
+# ============================================================================
+# Hyperparameter search grid
+# ============================================================================
+HP_GRID = {
+    "lr_head":      [1e-3, 5e-4],
+    "dropout":      [0.3, 0.5],
+    "n_frames":     [6, 10],
+}
+
+
+# ============================================================================
+# Dataset
+# ============================================================================
+
+class AIDWindowDataset(Dataset):
+    """
+    Sliding-window dataset over per-scenario image sequences.
+
+    Each sample is a tuple (frames_tensor, label) where:
+      frames_tensor : float32 tensor [N_FRAMES_WINDOW, 3, IMAGE_SIZE, IMAGE_SIZE]
+      label         : int (0 or 1), label of the LAST frame in the window
+
+    Construction
+    ------------
+    1.  Load master_metadata.csv and keep only rows belonging to the given
+        scenario_id set (enforced from the SUMO HDF5 split).
+    2.  For each scenario, sort frames by frame_id and build windows:
+            window k = frames[k*stride : k*stride + WINDOW_SIZE]
+        Discard any window shorter than WINDOW_SIZE (tail of sequence).
+    3.  From each 60-frame window uniformly sample N_FRAMES_WINDOW indices.
+    4.  Label = label of the last frame (index WINDOW_SIZE-1) of the window.
+
+    No-leakage guarantee
+    --------------------
+    Scenario_ids are partitioned BEFORE constructing windows, so no window
+    can include frames from two different scenarios or split sets.
+    """
+
+    def __init__(
+        self,
+        scenario_ids: set,
+        split_name:   str,
+        n_frames:     int   = N_FRAMES_WINDOW,
+        window_size:  int   = WINDOW_SIZE,
+        stride:       int   = WINDOW_STRIDE,
+        augment:      bool  = False,
+    ) -> None:
+        self.n_frames    = n_frames
+        self.window_size = window_size
+        self.augment     = augment
+
+        # ── Load metadata ──────────────────────────────────────────────────
+        if not MASTER_CSV.exists():
+            raise FileNotFoundError(
+                f"master_metadata.csv not found at {MASTER_CSV}\n"
+                "Run carla_capture.py first to generate the dataset."
+            )
+        meta = pd.read_csv(MASTER_CSV)
+        # Keep only scenarios in this split
+        meta = meta[meta["scenario_id"].isin(scenario_ids)].copy()
+
+        if meta.empty:
+            raise ValueError(
+                f"No metadata rows found for {split_name} split "
+                f"({len(scenario_ids)} scenario IDs). "
+                "Check that master_metadata.csv and the SUMO HDF5 splits match."
+            )
+
+        # ── Build windows ──────────────────────────────────────────────────
+        self.windows: List[Tuple[List[str], int]] = []   # (img_path_list, label)
+        skipped_short = 0
+
+        for scen_id, grp in meta.groupby("scenario_id"):
+            grp = grp.sort_values("frame_id").reset_index(drop=True)
+            n   = len(grp)
+
+            for start in range(0, n - window_size + 1, stride):
+                end   = start + window_size
+                chunk = grp.iloc[start:end]
+                # Uniformly sample n_frames indices from the window
+                sample_idx = np.linspace(0, window_size - 1, n_frames, dtype=int)
+                paths  = [
+                    str(DATASET_DIR / scen_id / "images" / chunk.iloc[i]["filename"])
+                    for i in sample_idx
+                ]
+                label  = int(chunk.iloc[-1]["incident_label"])
+                self.windows.append((paths, label))
+
+            remaining = (n - window_size) % stride if n >= window_size else 0
+            if n < window_size:
+                skipped_short += 1
+
+        n0 = sum(1 for _, lbl in self.windows if lbl == 0)
+        n1 = sum(1 for _, lbl in self.windows if lbl == 1)
+        print(f"  [{split_name}] {len(self.windows):,} windows  "
+              f"({n0:,} label=0  {n1:,} label=1)  "
+              f"from {meta['scenario_id'].nunique()} scenarios"
+              + (f"  (skipped {skipped_short} short sequences)" if skipped_short else ""))
+
+        # ── Image transforms ───────────────────────────────────────────────
+        if augment:
+            self.transform = transforms.Compose([
+                transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+                transforms.RandomHorizontalFlip(p=0.0),   # horizontal flip OFF
+                # (horizontal flip would invert lane geometry — avoid for traffic)
+                transforms.ColorJitter(
+                    brightness=0.2, contrast=0.2, saturation=0.1, hue=0.0
+                ),
+                transforms.RandomGrayscale(p=0.05),       # occasional B&W
+                transforms.ToTensor(),
+                transforms.Normalize(NORM_MEAN, NORM_STD),
+            ])
+        else:
+            self.transform = transforms.Compose([
+                transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+                transforms.ToTensor(),
+                transforms.Normalize(NORM_MEAN, NORM_STD),
+            ])
+
+    def __len__(self) -> int:
+        return len(self.windows)
+
+    def __getitem__(self, idx: int):
+        paths, label = self.windows[idx]
+        frames = []
+        for p in paths:
+            img = Image.open(p).convert("RGB")
+            frames.append(self.transform(img))
+        # Stack into [N_FRAMES, C, H, W]
+        frames_tensor = torch.stack(frames)
+        return frames_tensor, torch.tensor(label, dtype=torch.float32)
+
+
+# ============================================================================
+# Model
+# ============================================================================
+
+class TemporalEfficientNet(nn.Module):
+    """
+    EfficientNet-B0 backbone with per-frame feature extraction and
+    temporal mean-pooling aggregation.
+
+    Forward pass
+    ------------
+    Input  : [batch, n_frames, 3, H, W]
+    Step 1 : Flatten to [batch*n_frames, 3, H, W]
+    Step 2 : EfficientNet-B0 feature extractor  → [batch*n_frames, 1280]
+    Step 3 : Reshape to [batch, n_frames, 1280]
+    Step 4 : Mean pool over frame axis           → [batch, 1280]
+    Step 5 : Dropout → Linear(1280, 256) → ReLU → Dropout → Linear(256, 1)
+    Output : [batch] raw logit (use with BCEWithLogitsLoss)
+
+    Memory note for GTX 1060 3GB
+    -----------------------------
+    With backbone frozen (phase 1): activations not stored → ~500 MB peak.
+    With fine-tuning (phase 2): gradient checkpointing on backbone blocks
+    keeps peak under ~2 GB for batch_size=6, n_frames=8.
+    """
+
+    def __init__(self, dropout: float = DROPOUT, n_frames: int = N_FRAMES_WINDOW) -> None:
+        super().__init__()
+        self.n_frames = n_frames
+
+        # Load pretrained EfficientNet-B0
+        weights  = EfficientNet_B0_Weights.IMAGENET1K_V1
+        backbone = efficientnet_b0(weights=weights)
+
+        # Keep only the feature extractor (drop the classifier head)
+        self.features    = backbone.features       # Conv+MBConv blocks → [B,1280,7,7]
+        self.avgpool     = backbone.avgpool         # AdaptiveAvgPool2d → [B,1280,1,1]
+        feat_dim         = 1280
+
+        # Classification head
+        self.head = nn.Sequential(
+            nn.Dropout(p=dropout),
+            nn.Linear(feat_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout / 2),
+            nn.Linear(256, 1),
+        )
+
+        # Phase flags (set externally by trainer)
+        self._finetune_mode = False
+
+    # ── Backbone freeze / unfreeze ─────────────────────────────────────────
+
+    def freeze_backbone(self) -> None:
+        """Phase 1: only the head trains."""
+        for p in self.features.parameters():
+            p.requires_grad = False
+        for p in self.avgpool.parameters():
+            p.requires_grad = False
+        self._finetune_mode = False
+        print("  [MODEL] Backbone frozen — training head only.")
+
+    def unfreeze_last_blocks(self, n_blocks: int = 3) -> None:
+        """Phase 2: unfreeze the last n MBConv blocks + head for fine-tuning."""
+        # features is an nn.Sequential; blocks are roughly indices 0..8
+        # Unfreeze from the end
+        modules = list(self.features.children())
+        for mod in modules[:-n_blocks]:
+            for p in mod.parameters():
+                p.requires_grad = False
+        for mod in modules[-n_blocks:]:
+            for p in mod.parameters():
+                p.requires_grad = True
+        for p in self.avgpool.parameters():
+            p.requires_grad = True
+        self._finetune_mode = True
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total     = sum(p.numel() for p in self.parameters())
+        print(f"  [MODEL] Unfroze last {n_blocks} backbone blocks "
+              f"({trainable:,}/{total:,} params trainable).")
+
+    # ── Forward ───────────────────────────────────────────────────────────
+
+    def _extract(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract 1280-d feature for a batch of images [B, C, H, W]."""
+        feat = self.features(x)
+        feat = self.avgpool(feat)
+        return feat.flatten(1)            # [B, 1280]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, n_frames, C, H, W]
+        B, T, C, H, W = x.shape
+
+        if self._finetune_mode:
+            # Gradient checkpointing to save VRAM during fine-tuning
+            x_flat = x.view(B * T, C, H, W)
+            feat   = torch.utils.checkpoint.checkpoint(self._extract, x_flat)
+        else:
+            with torch.no_grad():
+                x_flat = x.view(B * T, C, H, W)
+                feat   = self._extract(x_flat)
+
+        feat = feat.view(B, T, -1)         # [B, T, 1280]
+        feat = feat.mean(dim=1)            # [B, 1280] — temporal mean pool
+        return self.head(feat).squeeze(1)  # [B]
+
+
+# ============================================================================
+# Trainer / Model wrapper  (mirrors AIDModel in model.py)
+# ============================================================================
+
+class AIDCNNModel:
+    """
+    Full training + evaluation wrapper for the temporal CNN.
+
+    Mirrors the structure of model.py's AIDModel for consistency.
+    """
+
+    def __init__(
+        self,
+        n_frames:       int   = N_FRAMES_WINDOW,
+        dropout:        float = DROPOUT,
+        lr_head:        float = LR_HEAD,
+        lr_finetune:    float = LR_FINETUNE,
+        batch_size:     int   = BATCH_SIZE,
+        phase1_epochs:  int   = PHASE1_EPOCHS,
+        num_epochs:     int   = NUM_EPOCHS,
+        early_stop_pat: int   = EARLY_STOP_PAT,
+        weight_decay:   float = WEIGHT_DECAY,
+    ) -> None:
+        self.n_frames       = n_frames
+        self.dropout        = dropout
+        self.lr_head        = lr_head
+        self.lr_finetune    = lr_finetune
+        self.batch_size     = batch_size
+        self.phase1_epochs  = phase1_epochs
+        self.num_epochs     = num_epochs
+        self.early_stop_pat = early_stop_pat
+        self.weight_decay   = weight_decay
+
+        self.model:             Optional[TemporalEfficientNet] = None
+        self.device:            torch.device                   = self._pick_device()
+        self.decision_threshold: float                         = 0.5
+        self.history:           Dict[str, list]                = defaultdict(list)
+        self.best_val_loss:     float                          = math.inf
+        self.best_val_f1:       float                          = 0.0
+        self.train_time_s:      float                          = 0.0
+
+    @staticmethod
+    def _pick_device() -> torch.device:
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            mem  = torch.cuda.get_device_properties(0).total_memory / 1e9
+            print(f"  [DEVICE] GPU: {name}  ({mem:.1f} GB VRAM)")
+            return torch.device("cuda")
+        print("  [DEVICE] No CUDA — using CPU (training will be slow)")
+        return torch.device("cpu")
+
+    # ── Data loading ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _load_scenario_splits() -> Tuple[set, set, set]:
+        """
+        Read scenario IDs from the SUMO-generated HDF5 splits.
+        Returns (train_ids, val_ids, test_ids) as sets of strings.
+        This guarantees the CNN uses exactly the same scenario partition
+        as the Random Forest macro model.
+        """
+        print("📂 Loading SUMO HDF5 splits to align scenario IDs...")
+        splits = {}
+        for name, h5_path in [("train", cfg.train_h5), ("val", cfg.val_h5), ("test", cfg.test_h5)]:
+            if not Path(h5_path).exists():
+                raise FileNotFoundError(
+                    f"{name}.h5 not found at {h5_path}\n"
+                    "Run carla_capture.py (or simulation.py) first to generate SUMO data."
+                )
+            df = pd.read_hdf(h5_path, key="data", columns=["scenario_id"])
+            ids = set(df["scenario_id"].unique())
+            splits[name] = ids
+            print(f"  {name:5s}: {len(ids):4d} scenarios")
+
+        # Sanity: no overlap between splits
+        overlap_tv = splits["train"] & splits["val"]
+        overlap_tt = splits["train"] & splits["test"]
+        overlap_vt = splits["val"]   & splits["test"]
+        if overlap_tv or overlap_tt or overlap_vt:
+            raise RuntimeError(
+                f"Scenario leakage in SUMO splits! "
+                f"train∩val={len(overlap_tv)} "
+                f"train∩test={len(overlap_tt)} "
+                f"val∩test={len(overlap_vt)}"
+            )
+        print("  ✅ No scenario overlap between splits (no leakage).")
+        return splits["train"], splits["val"], splits["test"]
+
+    def build_dataloaders(
+        self,
+        train_ids: set,
+        val_ids:   set,
+        test_ids:  set,
+    ) -> Tuple[DataLoader, DataLoader, DataLoader]:
+        """Build train/val/test DataLoaders."""
+        print("\n📦 Building datasets...")
+        train_ds = AIDWindowDataset(train_ids, "train", n_frames=self.n_frames, augment=True)
+        val_ds   = AIDWindowDataset(val_ids,   "val",   n_frames=self.n_frames, augment=False)
+        test_ds  = AIDWindowDataset(test_ids,  "test",  n_frames=self.n_frames, augment=False)
+
+        # Compute positive class weight for BCE loss to handle any residual imbalance
+        labels = [lbl for _, lbl in train_ds.windows]
+        n0 = labels.count(0)
+        n1 = labels.count(1)
+        # pos_weight = n0/n1 (how many negatives per positive); clip to [0.5, 5]
+        pos_w = max(0.5, min(5.0, n0 / max(n1, 1)))
+        self._pos_weight = torch.tensor([pos_w], device=self.device)
+        print(f"  BCE pos_weight = {pos_w:.2f}  (n0={n0:,} n1={n1:,})")
+
+        num_workers = min(4, os.cpu_count() or 1)
+        train_loader = DataLoader(
+            train_ds, batch_size=self.batch_size,
+            shuffle=True,  num_workers=num_workers, pin_memory=True,
+            persistent_workers=num_workers > 0,
+        )
+        val_loader = DataLoader(
+            val_ds,   batch_size=self.batch_size,
+            shuffle=False, num_workers=num_workers, pin_memory=True,
+            persistent_workers=num_workers > 0,
+        )
+        test_loader = DataLoader(
+            test_ds,  batch_size=self.batch_size,
+            shuffle=False, num_workers=num_workers, pin_memory=True,
+            persistent_workers=num_workers > 0,
+        )
+        return train_loader, val_loader, test_loader
+
+    # ── Training ──────────────────────────────────────────────────────────
+
+    def _make_optimizer(self, phase: int) -> torch.optim.Optimizer:
+        if phase == 1:
+            params = [p for p in self.model.parameters() if p.requires_grad]
+            return torch.optim.Adam(params, lr=self.lr_head, weight_decay=self.weight_decay)
+        else:
+            # Differential LR: lower for backbone, higher for head
+            backbone_params = list(self.model.features.parameters()) + \
+                              list(self.model.avgpool.parameters())
+            head_params     = list(self.model.head.parameters())
+            return torch.optim.Adam([
+                {"params": [p for p in backbone_params if p.requires_grad],
+                 "lr": self.lr_finetune},
+                {"params": head_params,
+                 "lr": self.lr_finetune * 5},
+            ], weight_decay=self.weight_decay)
+
+    def _run_epoch(
+        self,
+        loader:    DataLoader,
+        optimizer: Optional[torch.optim.Optimizer],
+        training:  bool,
+    ) -> Tuple[float, float]:
+        """Run one epoch. Returns (avg_loss, f1_score)."""
+        self.model.train(training)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=self._pos_weight)
+        total_loss, all_preds, all_labels = 0.0, [], []
+
+        with torch.set_grad_enabled(training):
+            for frames, labels in loader:
+                frames = frames.to(self.device, non_blocking=True)
+                labels = labels.to(self.device, non_blocking=True)
+
+                if training:
+                    optimizer.zero_grad()
+
+                logits = self.model(frames)
+                loss   = criterion(logits, labels)
+
+                if training:
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    optimizer.step()
+
+                total_loss += loss.item() * len(labels)
+                probs = torch.sigmoid(logits).detach().cpu().numpy()
+                all_preds.extend((probs >= 0.5).astype(int).tolist())
+                all_labels.extend(labels.cpu().numpy().astype(int).tolist())
+
+        avg_loss = total_loss / max(len(loader.dataset), 1)
+        ep_f1    = f1_score(all_labels, all_preds, zero_division=0)
+        return avg_loss, ep_f1
+
+    def train(
+        self,
+        train_loader: DataLoader,
+        val_loader:   DataLoader,
+        tag:          str = "",
+    ) -> None:
+        """
+        Full two-phase training loop with early stopping.
+
+        Phase 1 (phase1_epochs):   backbone frozen, head trains from scratch.
+        Phase 2 (remaining epochs): last 3 backbone blocks unfrozen, fine-tuned.
+        """
+        print("\n" + "=" * 60)
+        print(f"  CNN TRAINING  {tag}")
+        print("=" * 60)
+
+        self.model = TemporalEfficientNet(dropout=self.dropout, n_frames=self.n_frames)
+        self.model.to(self.device)
+
+        # ── Phase 1: frozen backbone ──────────────────────────────────────
+        print(f"\n── Phase 1: frozen backbone  ({self.phase1_epochs} epochs) ──")
+        self.model.freeze_backbone()
+        opt1  = self._make_optimizer(phase=1)
+        sched1 = ReduceLROnPlateau(opt1, mode="min", factor=0.5, patience=2, verbose=True)
+
+        best_ckpt  = CNN_MODELS / f"best{'_' + tag if tag else ''}.pt"
+        no_improve = 0
+
+        t0 = time.time()
+        for epoch in range(1, self.phase1_epochs + 1):
+            tr_loss, tr_f1 = self._run_epoch(train_loader, opt1, training=True)
+            vl_loss, vl_f1 = self._run_epoch(val_loader,   None,  training=False)
+            sched1.step(vl_loss)
+            self._log_epoch("P1", epoch, tr_loss, tr_f1, vl_loss, vl_f1)
+
+            if vl_loss < self.best_val_loss:
+                self.best_val_loss = vl_loss
+                self.best_val_f1   = vl_f1
+                torch.save(self.model.state_dict(), best_ckpt)
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= self.early_stop_pat:
+                    print(f"  [EARLY STOP] Phase 1 epoch {epoch} — "
+                          f"no val improvement for {self.early_stop_pat} epochs.")
+                    break
+
+        # ── Phase 2: fine-tune last backbone blocks ───────────────────────
+        remaining_epochs = self.num_epochs - self.phase1_epochs
+        if remaining_epochs > 0:
+            print(f"\n── Phase 2: fine-tune backbone  (up to {remaining_epochs} epochs) ──")
+            # Load best phase-1 weights before fine-tuning
+            self.model.load_state_dict(torch.load(best_ckpt, map_location=self.device))
+            self.model.unfreeze_last_blocks(n_blocks=3)
+            opt2   = self._make_optimizer(phase=2)
+            sched2 = ReduceLROnPlateau(opt2, mode="min", factor=0.5, patience=2, verbose=True)
+            no_improve = 0
+
+            for epoch in range(1, remaining_epochs + 1):
+                tr_loss, tr_f1 = self._run_epoch(train_loader, opt2, training=True)
+                vl_loss, vl_f1 = self._run_epoch(val_loader,   None,  training=False)
+                sched2.step(vl_loss)
+                self._log_epoch("P2", epoch, tr_loss, tr_f1, vl_loss, vl_f1)
+
+                if vl_loss < self.best_val_loss:
+                    self.best_val_loss = vl_loss
+                    self.best_val_f1   = vl_f1
+                    torch.save(self.model.state_dict(), best_ckpt)
+                    no_improve = 0
+                else:
+                    no_improve += 1
+                    if no_improve >= self.early_stop_pat:
+                        print(f"  [EARLY STOP] Phase 2 epoch {epoch} — "
+                              f"no val improvement for {self.early_stop_pat} epochs.")
+                        break
+
+        self.train_time_s = time.time() - t0
+        print(f"\n  Total training time: {self.train_time_s/60:.1f} min")
+        print(f"  Best val loss: {self.best_val_loss:.4f}   best val F1: {self.best_val_f1:.4f}")
+
+        # Load best checkpoint for downstream evaluation
+        self.model.load_state_dict(torch.load(best_ckpt, map_location=self.device))
+        print(f"  Best checkpoint loaded from {best_ckpt.name}")
+
+    def _log_epoch(
+        self, phase: str, epoch: int,
+        tr_loss: float, tr_f1: float,
+        vl_loss: float, vl_f1: float,
+    ) -> None:
+        self.history["phase"].append(phase)
+        self.history["epoch"].append(epoch)
+        self.history["train_loss"].append(tr_loss)
+        self.history["train_f1"].append(tr_f1)
+        self.history["val_loss"].append(vl_loss)
+        self.history["val_f1"].append(vl_f1)
+        star = " ★" if vl_loss <= self.best_val_loss else ""
+        print(
+            f"  [{phase}] Epoch {epoch:3d}  "
+            f"train_loss={tr_loss:.4f} f1={tr_f1:.3f}  |  "
+            f"val_loss={vl_loss:.4f} f1={vl_f1:.3f}{star}"
+        )
+
+    # ── Threshold selection (mirrors model.py) ────────────────────────────
+
+    def select_decision_threshold(self, val_loader: DataLoader) -> None:
+        """
+        Select decision threshold from validation set.
+        Criterion: maximise TPR subject to FAR ≤ 0.01%.
+        Mirrors the same logic used in model.py for comparability.
+        """
+        print("\n🎯 Selecting decision threshold from validation set...")
+        all_probs, all_labels = self._predict_proba(val_loader)
+        fpr, tpr, thresholds = roc_curve(all_labels, all_probs)
+        max_far = 0.0001
+        valid   = fpr <= max_far
+
+        if not np.any(valid):
+            print("  ⚠️  No threshold satisfies FAR ≤ 0.01% — using 0.5")
+            self.decision_threshold = 0.5
+            return
+
+        best_idx                 = np.argmax(tpr[valid])
+        self.decision_threshold  = float(thresholds[valid][best_idx])
+        print(f"  ✅ threshold={self.decision_threshold:.3f}  "
+              f"FAR={fpr[valid][best_idx]*100:.3f}%  "
+              f"Recall={tpr[valid][best_idx]*100:.1f}%")
+
+    # ── Inference helpers ─────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def _predict_proba(
+        self, loader: DataLoader
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (probabilities, true_labels) arrays for a DataLoader."""
+        self.model.eval()
+        # In eval, we do NOT want gradient checkpointing (no_grad is enough)
+        self.model._finetune_mode = False
+        all_probs, all_labels = [], []
+        for frames, labels in loader:
+            frames = frames.to(self.device, non_blocking=True)
+            logits = self.model(frames)
+            probs  = torch.sigmoid(logits).cpu().numpy()
+            all_probs.extend(probs.tolist())
+            all_labels.extend(labels.numpy().astype(int).tolist())
+        return np.array(all_probs), np.array(all_labels)
+
+    # ── Evaluation ────────────────────────────────────────────────────────
+
+    def evaluate(
+        self,
+        loader:     DataLoader,
+        split_name: str = "test",
+        save_plots: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Full evaluation on a DataLoader. Returns metrics dict.
+        Mirrors model.py's evaluate() structure.
+        """
+        print(f"\n{'='*60}")
+        print(f"  EVALUATION — {split_name.upper()} SET")
+        print(f"{'='*60}")
+
+        all_probs, y_true = self._predict_proba(loader)
+        y_pred            = (all_probs >= self.decision_threshold).astype(int)
+
+        acc  = accuracy_score(y_true, y_pred)
+        prec = precision_score(y_true, y_pred, zero_division=0)
+        rec  = recall_score(y_true, y_pred, zero_division=0)
+        f1   = f1_score(y_true, y_pred, zero_division=0)
+        auc  = roc_auc_score(y_true, all_probs)
+        cm   = confusion_matrix(y_true, y_pred)
+
+        print(f"\n  Threshold : {self.decision_threshold:.3f}")
+        print(f"  Accuracy  : {acc:.4f}")
+        print(f"  Precision : {prec:.4f}")
+        print(f"  Recall    : {rec:.4f}")
+        print(f"  F1-score  : {f1:.4f}")
+        print(f"  ROC-AUC   : {auc:.4f}")
+        print(f"\n  Confusion matrix:")
+        print(f"    TN={cm[0,0]:5d}  FP={cm[0,1]:5d}")
+        print(f"    FN={cm[1,0]:5d}  TP={cm[1,1]:5d}")
+        print(f"\n{classification_report(y_true, y_pred, target_names=['no-incident','incident'])}")
+
+        metrics = dict(
+            split=split_name, accuracy=acc, precision=prec,
+            recall=rec, f1=f1, auc=auc,
+            tn=int(cm[0,0]), fp=int(cm[0,1]),
+            fn=int(cm[1,0]), tp=int(cm[1,1]),
+        )
+
+        if save_plots:
+            self._plot_confusion_matrix(cm, split_name)
+            self._plot_roc_curve(y_true, all_probs, auc, split_name)
+            if self.history["train_loss"]:
+                self._plot_training_history()
+
+        return metrics
+
+    def evaluate_per_scenario(
+        self,
+        loader:         DataLoader,
+        dataset:        AIDWindowDataset,
+        split_name:     str,
+        min_confirmed:  int = 3,
+    ) -> pd.DataFrame:
+        """
+        Scenario-level metrics: one detection decision per scenario.
+        Mirrors model.py's evaluate_per_scenario().
+        """
+        all_probs, _ = self._predict_proba(loader)
+        y_pred        = (all_probs >= self.decision_threshold).astype(int)
+
+        # Map window index → (scenario_id, label of last frame)
+        results = []
+        # Group windows by scenario
+        scenario_windows: Dict[str, List[Tuple[int, int, float]]] = defaultdict(list)
+        for i, (paths, label) in enumerate(dataset.windows):
+            # scenario_id is the parent folder name, extractable from first path
+            scen_id = Path(paths[0]).parts[-3]   # …/dataset/sXXXXX/images/frame_…
+            scenario_windows[scen_id].append((i, label, float(all_probs[i])))
+
+        for scen_id, windows_in_scen in scenario_windows.items():
+            idxs   = [w[0] for w in windows_in_scen]
+            labels = [w[1] for w in windows_in_scen]
+            probas = [w[2] for w in windows_in_scen]
+            preds  = y_pred[idxs]
+
+            has_incident  = int(max(labels))
+            n_detections  = int(preds.sum())
+            detected      = n_detections >= min_confirmed
+
+            # Time-to-detection (window index × stride × 0.5s per frame)
+            ttd = None
+            if has_incident and detected:
+                first_det_window = np.where(preds == 1)[0][0]
+                # Find first window where label=1 first appears
+                first_inc_window = next((j for j, lbl in enumerate(labels) if lbl == 1), None)
+                if first_inc_window is not None:
+                    ttd = (first_det_window - first_inc_window) * WINDOW_STRIDE * 0.5
+
+            results.append({
+                "scenario_id":     scen_id,
+                "has_incident":    has_incident,
+                "detected":        int(detected),
+                "n_windows":       len(windows_in_scen),
+                "n_detections":    n_detections,
+                "max_prob":        float(max(probas)),
+                "time_to_detect":  ttd,
+            })
+
+        df = pd.DataFrame(results)
+        tp = int(((df.has_incident == 1) & (df.detected == 1)).sum())
+        fn = int(((df.has_incident == 1) & (df.detected == 0)).sum())
+        fp = int(((df.has_incident == 0) & (df.detected == 1)).sum())
+        tn = int(((df.has_incident == 0) & (df.detected == 0)).sum())
+        dr  = tp / max(tp + fn, 1)
+        far = fp / max(fp + tn, 1)
+
+        print(f"\n📊 SCENARIO-LEVEL — {split_name.upper()}")
+        print(f"  TP={tp}  FN={fn}  FP={fp}  TN={tn}")
+        print(f"  Detection Rate : {dr:.2%}")
+        print(f"  False Alarm Rate: {far:.2%}")
+        if df["time_to_detect"].notna().any():
+            median_ttd = df["time_to_detect"].median()
+            print(f"  Median Time-to-Detection: {median_ttd:.1f}s")
+
+        df.to_csv(CNN_RESULTS / f"scenario_eval_{split_name}.csv", index=False)
+        return df
+
+    # ── Plotting ──────────────────────────────────────────────────────────
+
+    def _plot_training_history(self) -> None:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+        epochs = list(range(1, len(self.history["train_loss"]) + 1))
+        ax1.plot(epochs, self.history["train_loss"], label="Train")
+        ax1.plot(epochs, self.history["val_loss"],   label="Val")
+        ax1.set_title("Loss")
+        ax1.set_xlabel("Epoch")
+        ax1.legend()
+        ax1.grid(alpha=0.3)
+        ax2.plot(epochs, self.history["train_f1"], label="Train")
+        ax2.plot(epochs, self.history["val_f1"],   label="Val")
+        ax2.set_title("F1-score")
+        ax2.set_xlabel("Epoch")
+        ax2.legend()
+        ax2.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(CNN_RESULTS / "training_history.png", dpi=150)
+        plt.close()
+        print(f"  💾 Training history saved.")
+
+    def _plot_confusion_matrix(self, cm: np.ndarray, split_name: str) -> None:
+        import seaborn as sns
+        plt.figure(figsize=(5, 4))
+        sns.heatmap(
+            cm, annot=True, fmt="d", cmap="Blues",
+            xticklabels=["No incident", "Incident"],
+            yticklabels=["No incident", "Incident"],
+        )
+        plt.ylabel("True"); plt.xlabel("Predicted")
+        plt.title(f"Confusion Matrix — {split_name}")
+        plt.tight_layout()
+        plt.savefig(CNN_RESULTS / f"confusion_matrix_{split_name}.png", dpi=150)
+        plt.close()
+
+    def _plot_roc_curve(
+        self, y_true: np.ndarray, probs: np.ndarray,
+        auc: float, split_name: str,
+    ) -> None:
+        fpr, tpr, _ = roc_curve(y_true, probs)
+        plt.figure(figsize=(6, 5))
+        plt.plot(fpr, tpr, label=f"AUC = {auc:.4f}")
+        plt.plot([0, 1], [0, 1], "k--", alpha=0.4)
+        plt.xlabel("False Positive Rate")
+        plt.ylabel("True Positive Rate")
+        plt.title(f"ROC Curve — {split_name}")
+        plt.legend()
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(CNN_RESULTS / f"roc_curve_{split_name}.png", dpi=150)
+        plt.close()
+
+    # ── Save / load ───────────────────────────────────────────────────────
+
+    def save(self, tag: str = "") -> None:
+        suffix = f"_{tag}" if tag else ""
+        model_path = CNN_MODELS / f"cnn_model{suffix}.pt"
+        meta_path  = CNN_MODELS / f"cnn_meta{suffix}.json"
+
+        torch.save(self.model.state_dict(), model_path)
+        meta = {
+            "n_frames":          self.n_frames,
+            "dropout":           self.dropout,
+            "lr_head":           self.lr_head,
+            "lr_finetune":       self.lr_finetune,
+            "batch_size":        self.batch_size,
+            "decision_threshold":self.decision_threshold,
+            "best_val_loss":     self.best_val_loss,
+            "best_val_f1":       self.best_val_f1,
+            "train_time_s":      self.train_time_s,
+            "image_size":        IMAGE_SIZE,
+            "window_size":       WINDOW_SIZE,
+            "window_stride":     WINDOW_STRIDE,
+            "norm_mean":         NORM_MEAN,
+            "norm_std":          NORM_STD,
+        }
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+        print(f"  💾 Model saved → {model_path.name}")
+        print(f"  💾 Metadata saved → {meta_path.name}")
+
+    def load(self, tag: str = "") -> None:
+        suffix     = f"_{tag}" if tag else ""
+        model_path = CNN_MODELS / f"cnn_model{suffix}.pt"
+        meta_path  = CNN_MODELS / f"cnn_meta{suffix}.json"
+        with open(meta_path) as f:
+            meta = json.load(f)
+        self.n_frames            = meta["n_frames"]
+        self.dropout             = meta["dropout"]
+        self.decision_threshold  = meta["decision_threshold"]
+        self.model = TemporalEfficientNet(
+            dropout=self.dropout, n_frames=self.n_frames
+        )
+        self.model.load_state_dict(
+            torch.load(model_path, map_location=self.device)
+        )
+        self.model.to(self.device)
+        print(f"  ✅ CNN model loaded from {model_path.name}")
+        print(f"     threshold={self.decision_threshold:.3f}  "
+              f"n_frames={self.n_frames}  best_val_f1={meta['best_val_f1']:.4f}")
+
+
+# ============================================================================
+# Hyperparameter search
+# ============================================================================
+
+def run_hp_search(
+    train_loader: DataLoader,
+    val_loader:   DataLoader,
+    train_ids: set, val_ids: set, test_ids: set,
+) -> Dict:
+    """
+    Grid search over HP_GRID combinations.
+    Each combination is trained for phase1_epochs only (frozen backbone)
+    to quickly estimate val F1, then the best is fully trained.
+    """
+    print("\n" + "="*60)
+    print("  HYPERPARAMETER SEARCH")
+    print("="*60)
+
+    from itertools import product
+    keys   = list(HP_GRID.keys())
+    values = list(HP_GRID.values())
+    combos = list(product(*values))
+
+    print(f"  Searching {len(combos)} combinations × {PHASE1_EPOCHS} epochs each ...")
+    results = []
+
+    for i, combo in enumerate(combos, 1):
+        hp = dict(zip(keys, combo))
+        tag = f"hp{i}"
+        print(f"\n── Combo {i}/{len(combos)}: {hp} ──")
+
+        # Build fresh dataloaders with the n_frames for this combo
+        nf = hp.get("n_frames", N_FRAMES_WINDOW)
+        tr_ds = AIDWindowDataset(train_ids, "train", n_frames=nf, augment=True)
+        vl_ds = AIDWindowDataset(val_ids,   "val",   n_frames=nf, augment=False)
+        nw    = min(4, os.cpu_count() or 1)
+        tr_ld = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True,
+                           num_workers=nw, pin_memory=True)
+        vl_ld = DataLoader(vl_ds, batch_size=BATCH_SIZE, shuffle=False,
+                           num_workers=nw, pin_memory=True)
+
+        m = AIDCNNModel(
+            n_frames=nf,
+            dropout=hp.get("dropout", DROPOUT),
+            lr_head=hp.get("lr_head", LR_HEAD),
+            phase1_epochs=PHASE1_EPOCHS,
+            num_epochs=PHASE1_EPOCHS,   # phase 1 only for HP search
+        )
+        m.train(tr_ld, vl_ld, tag=tag)
+        hp["val_f1"]   = m.best_val_f1
+        hp["val_loss"] = m.best_val_loss
+        results.append(hp.copy())
+        print(f"  → val_f1={m.best_val_f1:.4f}  val_loss={m.best_val_loss:.4f}")
+
+        # Free GPU memory between combos
+        del m
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    results_df = pd.DataFrame(results).sort_values("val_f1", ascending=False)
+    print(f"\n{'='*60}")
+    print("  HP SEARCH RESULTS (sorted by val F1)")
+    print(results_df.to_string(index=False))
+    results_df.to_csv(CNN_RESULTS / "hp_search_results.csv", index=False)
+
+    best = results_df.iloc[0].to_dict()
+    print(f"\n  🏆 Best combo: {best}")
+    return best
+
+
+# ============================================================================
+# Main pipeline
+# ============================================================================
+
+def train_and_evaluate(
+    hp_search:     bool = False,
+    phase1_only:   bool = False,
+    evaluate_only: bool = False,
+) -> None:
+    print("\n" + "="*60)
+    print("  AUTOMATIC INCIDENT DETECTION — CNN TRAINING")
+    print("="*60 + "\n")
+
+    # ── 1. Load scenario splits from SUMO HDF5 ────────────────────────────
+    train_ids, val_ids, test_ids = AIDCNNModel._load_scenario_splits()
+
+    # ── 2. (Optional) Hyperparameter search ──────────────────────────────
+    best_hp = {}
+    if hp_search and not evaluate_only:
+        # Need dataloaders for search — use defaults, per-combo rebuilt inside
+        best_hp = run_hp_search(None, None, train_ids, val_ids, test_ids)
+        # Clean GPU
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # ── 3. Build final model with best (or default) HPs ──────────────────
+    n_frames = int(best_hp.get("n_frames",  N_FRAMES_WINDOW))
+    dropout  = float(best_hp.get("dropout", DROPOUT))
+    lr_head  = float(best_hp.get("lr_head", LR_HEAD))
+
+    cnn = AIDCNNModel(
+        n_frames       = n_frames,
+        dropout        = dropout,
+        lr_head        = lr_head,
+        lr_finetune    = LR_FINETUNE,
+        batch_size     = BATCH_SIZE,
+        phase1_epochs  = PHASE1_EPOCHS,
+        num_epochs     = PHASE1_EPOCHS if phase1_only else NUM_EPOCHS,
+        early_stop_pat = EARLY_STOP_PAT,
+    )
+
+    if evaluate_only:
+        cnn.load()
+        # Still need dataloaders for evaluation
+        _, val_loader, test_loader = cnn.build_dataloaders(train_ids, val_ids, test_ids)
+        val_ds  = val_loader.dataset
+        test_ds = test_loader.dataset
+    else:
+        # ── 4. Build dataloaders ─────────────────────────────────────────
+        train_loader, val_loader, test_loader = cnn.build_dataloaders(
+            train_ids, val_ids, test_ids
+        )
+        val_ds  = val_loader.dataset
+        test_ds = test_loader.dataset
+
+        # ── 5. Train ─────────────────────────────────────────────────────
+        cnn.train(train_loader, val_loader, tag="final")
+
+        # ── 6. Select threshold from validation set ──────────────────────
+        cnn.select_decision_threshold(val_loader)
+
+        # ── 7. Save ───────────────────────────────────────────────────────
+        print(f"\n{'='*60}  SAVING")
+        cnn.save(tag="final")
+
+        # ── 8. Validation set evaluation ─────────────────────────────────
+        val_metrics = cnn.evaluate(val_loader, split_name="val", save_plots=True)
+        cnn.evaluate_per_scenario(val_loader, val_ds, split_name="val")
+
+    # ── 9. Test set evaluation ────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print("  FINAL TEST SET EVALUATION")
+    print("="*60)
+    test_metrics = cnn.evaluate(test_loader, split_name="test", save_plots=True)
+    cnn.evaluate_per_scenario(test_loader, test_ds, split_name="test")
+
+    # ── 10. Save final metrics JSON ───────────────────────────────────────
+    metrics_path = CNN_RESULTS / "test_metrics.json"
+    with open(metrics_path, "w") as f:
+        json.dump(test_metrics, f, indent=2)
+    print(f"\n  💾 Test metrics → {metrics_path}")
+
+    # ── 11. Summary ───────────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print("  ✅ CNN TRAINING AND EVALUATION COMPLETE")
+    print("="*60)
+    print(f"  Results folder : {CNN_RESULTS}")
+    print(f"  Model folder   : {CNN_MODELS}")
+    print(f"\n  Compare with Random Forest results in:")
+    print(f"    {_PROJECT / 'results'}")
+    print(f"\n  Test F1   : {test_metrics['f1']:.4f}")
+    print(f"  Test AUC  : {test_metrics['auc']:.4f}")
+    print(f"  Test Rec  : {test_metrics['recall']:.4f}")
+
+
+# ============================================================================
+# Entry point
+# ============================================================================
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="CNN training and evaluation for AID image dataset."
+    )
+    parser.add_argument(
+        "--hp-search", action="store_true",
+        help="Run hyperparameter grid search before final training.",
+    )
+    parser.add_argument(
+        "--phase1-only", action="store_true",
+        help="Only run phase 1 (frozen backbone). Faster; useful for quick validation.",
+    )
+    parser.add_argument(
+        "--evaluate-only", action="store_true",
+        help="Skip training; load saved model and run test-set evaluation.",
+    )
+    args = parser.parse_args()
+
+    warnings.filterwarnings("ignore", category=UserWarning)
+    train_and_evaluate(
+        hp_search     = args.hp_search,
+        phase1_only   = args.phase1_only,
+        evaluate_only = args.evaluate_only,
+    )
+
+    #C:\Users\36302\AppData\Local\Programs\Python\Python38\python.exe cnn_model.py
