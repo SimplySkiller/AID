@@ -1527,9 +1527,11 @@ def main() -> None:
     parser.add_argument(
         "--no-incident-only", action="store_true",
         help=(
-            "Run ONLY non-incident SUMO scenarios (no CARLA, no incident injection). "
-            "Useful for collecting additional macro detector data without images. "
-            "Output is still written to all_data.h5 in the data folder."
+            "Run ONLY non-incident SUMO scenarios (incident injection skipped). "
+            "CARLA still runs and captures images for each NI scenario, so the "
+            "output includes both all_data.h5 (macro) AND images+metadata.csv "
+            "(micro). Useful for generating test data for the fusion evaluation "
+            "script (test_fusion.py) under normal-traffic-only conditions."
         ),
     )
     args = parser.parse_args()
@@ -1546,17 +1548,19 @@ def main() -> None:
     scenarios = enumerate_scenarios()
 
     # ── No-incident-only filter ───────────────────────────────────────────────
+    # Note: CARLA still runs normally for NI image capture.
+    # Only incident injection is skipped (scenario list is filtered to NI only).
     if args.no_incident_only:
         scenarios = [s for s in scenarios if s["incident_position"] is None]
         print(f"[MODE] --no-incident-only: keeping {len(scenarios)} non-incident scenarios "
-              f"(incident scenarios skipped).")
+              f"(incident scenarios skipped, CARLA image capture still active).")
 
     if args.limit:
         scenarios = scenarios[: args.limit]
 
     print(f"[MAIN] Running {len(scenarios)} scenario(s).  "
           f"dry_run={args.dry_run}  no_incident_only={args.no_incident_only}")
-    if not args.dry_run and not args.no_incident_only:
+    if not args.dry_run:
         print()
         print("[CARLA] Before running, start CARLA with this exact command:")
         print(f"  {CARLA_PACKAGED_EXE}"
@@ -1566,8 +1570,9 @@ def main() -> None:
         print("  script will detect it automatically on port 2000.")
         print()
 
-    # In no-incident-only mode, force dry_run so CARLA is never started.
-    effective_dry_run = args.dry_run or args.no_incident_only
+    # CARLA always runs unless --dry-run is explicitly set.
+    # --no-incident-only only filters the scenario list, it does NOT skip CARLA.
+    effective_dry_run = args.dry_run
     runner = AIDScenarioRunner(dry_run=effective_dry_run)
 
     try:
@@ -1600,12 +1605,10 @@ def main() -> None:
             traci.close()
         except Exception:
             pass
-        if not args.no_incident_only:
-            import subprocess as _sp
-            _sp.run(["taskkill", "/f", "/im", "CarlaUE4.exe"],
-                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-        print("[MAIN] Cleanup done (SUMO closed"
-              + (", CarlaUE4 killed if script-launched" if not args.no_incident_only else "") + ").")
+        import subprocess as _sp
+        _sp.run(["taskkill", "/f", "/im", "CarlaUE4.exe"],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        print("[MAIN] Cleanup done (SUMO closed, CarlaUE4 killed if script-launched).")
 
     # ── Save all macro data at once ──────────────────────────────────────────
     if runner.all_macro_rows:
@@ -1695,5 +1698,25 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-# To start CARLA before running this script, paste into a terminal:
-# C:\carla_source\carla\Build\UE4Carla\0.9.10-dirty\WindowsNoEditor\CarlaUE4.exe -quality-level=Low -benchmark -fps=2 -RenderOffScreen -carla-port=2000
+# ── How to run from a terminal (without the Cursor play button) ───────────────
+#
+# Standard run (incident + non-incident, full dataset generation):
+#   1. Start CARLA first (paste into a separate terminal):
+#      C:\carla_source\carla\Build\UE4Carla\0.9.10-dirty\WindowsNoEditor\CarlaUE4.exe -quality-level=Low -benchmark -fps=2 -RenderOffScreen -carla-port=2000
+#   2. Wait ~30s for the map to load, then run:
+#      python carla_capture.py
+#
+# No-incident-only mode (NI macro + NI images, for testing FAR on real traffic):
+#   1. Start CARLA first (same command as above — CARLA is still needed for images)
+#   2. python carla_capture.py --no-incident-only
+#
+# Other useful flags:
+#   python carla_capture.py --dry-run              # SUMO only, no CARLA, fast validation
+#   python carla_capture.py --limit 4              # run first 4 scenarios only (smoke test)
+#   python carla_capture.py --no-incident-only --limit 8   # quick NI-only smoke test
+#   python carla_capture.py --split-only           # just rebuild train/val/test CSVs
+#
+# Output locations:
+#   Macro HDF5 : data/all_data.h5  (also split to data/train.h5, val.h5, test.h5)
+#   Images     : dataset/sXXXXX/images/frame_XXXXXX.png
+#   Metadata   : dataset/master_metadata.csv  (and train/val/test_metadata.csv)
