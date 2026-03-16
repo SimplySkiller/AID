@@ -82,12 +82,46 @@ from simulation import SUMOSimulator  # noqa: E402
 # ============================================================================
 # CARLA egg
 # ============================================================================
-_CARLA_EGG = r"C:\carla_source\carla\PythonAPI\carla\dist\carla-0.9.10-py3.8-win-amd64.egg"
-if os.path.exists(_CARLA_EGG):
-    sys.path.insert(0, _CARLA_EGG)
-else:
-    sys.exit(f"FATAL: CARLA egg not found at:\n  {_CARLA_EGG}\n"
-             "Update _CARLA_EGG at the top of carla_capture.py.")
+# CARLA Python package loader
+# ============================================================================
+#
+# Uses the hardcoded 0.9.10 egg path — this is intentional.  The "smart"
+# multi-egg search picks up a 0.9.15 egg from elsewhere on the system which
+# is API-incompatible with the 0.9.10 Unreal build (get_sensor_token fails).
+#
+# If this block fails, the most likely cause is a Python version mismatch:
+# the egg is built for py3.8 and you are running a different version.
+# Fix: run with  py -3.8 carla_capture.py  (or activate your py3.8 env).
+
+_CARLA_EGG = (
+    r"C:\carla_source\carla\PythonAPI\carla\dist"
+    r"\carla-0.9.10-py3.8-win-amd64.egg"
+)
+
+if not os.path.exists(_CARLA_EGG):
+    sys.exit(
+        f"FATAL: CARLA 0.9.10 egg not found at:\n  {_CARLA_EGG}\n"
+        "Update _CARLA_EGG at the top of carla_capture.py."
+    )
+
+sys.path.insert(0, _CARLA_EGG)
+
+# Verify it actually imports — catches Python version mismatch early with a
+# helpful message instead of a cryptic ImportError later during CarlaManager.start()
+try:
+    import carla as _carla_test
+    del _carla_test
+except ImportError:
+    sys.exit(
+        f"FATAL: Could not import the CARLA package.\n"
+        f"\n  Egg path : {_CARLA_EGG}\n"
+        f"  Python   : {sys.version.split()[0]}  ({sys.executable})\n"
+        f"\n  The egg is built for Python 3.8.  You appear to be running a "
+        f"different version.\n"
+        f"\n  Fix: run the script with Python 3.8:\n"
+        f"       py -3.8 carla_capture.py\n"
+        f"  or activate the conda / venv environment that has Python 3.8.\n"
+    )
 
 # ============================================================================
 # Tuneable constants
@@ -323,13 +357,7 @@ class CarlaManager:
     # ---- Lifecycle -----------------------------------------------------------
 
     def start(self) -> None:
-        try:
-            import carla as _carla
-        except ImportError:
-            sys.exit(
-                "FATAL: 'carla' package not importable.\n"
-                f"Check that the egg exists at:\n  {_CARLA_EGG}"
-            )
+        import carla as _carla   # egg already on sys.path — this is always safe
         self._carla = _carla
 
         # ── Step 1: connect to an already-running CARLA, or launch one ────────
