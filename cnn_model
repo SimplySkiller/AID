@@ -68,6 +68,14 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
+# Suppress torch.load FutureWarning globally — we use weights_only=True on all
+# our own loads (state_dicts are pure tensors, safe), but third-party callbacks
+# inside torchvision may still trigger it on older PyTorch builds.
+warnings.filterwarnings(
+    "ignore", category=FutureWarning, module="torch"
+)
+warnings.filterwarnings("ignore", category=UserWarning)
+
 # ── PyTorch ──────────────────────────────────────────────────────────────────
 try:
     import torch
@@ -134,6 +142,51 @@ HP_GRID = {
     "dropout":      [0.3, 0.5],
     "n_frames":     [6, 10],
 }
+
+
+# ============================================================================
+# Camera mask (removes sky / road-shoulder triangles)
+# ============================================================================
+
+class TriangleMask:
+    """
+    PIL transform that blacks-out the two sky/shoulder triangles in each frame.
+
+    Coordinates are for the native 384×640 camera output.  Apply BEFORE the
+    Resize so the mask is always pixel-accurate regardless of target image size.
+
+    Triangle vertices (taken from mask_crop.py, verified against camera FOV):
+      Left  : (0, 421)─(178, 0)─(0, 0)      top-left  corner (sky + shoulder)
+      Right : (383, 437)─(203, 0)─(383, 0)   top-right corner (sky + shoulder)
+
+    The mask is computed once at class load time and reused for every image,
+    so there is no per-image overhead from polygon rasterisation.
+    """
+
+    # Native camera resolution (must match carla_capture.py CAM_IMAGE_X/Y)
+    _W, _H = 384, 640
+
+    # Pre-rasterise the mask once at class definition time
+    _mask: "np.ndarray"   # (H, W) bool — True where pixels should be zeroed
+
+    @classmethod
+    def _build_mask(cls) -> np.ndarray:
+        from PIL import Image as _Image, ImageDraw as _Draw
+        m = _Image.new("L", (cls._W, cls._H), 0)
+        d = _Draw.Draw(m)
+        d.polygon([(0, 421), (178, 0), (0, 0)],       fill=255)
+        d.polygon([(383, 437), (203, 0), (383, 0)],    fill=255)
+        return np.array(m, dtype=bool)   # True = mask out
+
+    def __call__(self, img: "Image.Image") -> "Image.Image":
+        """Apply mask to a PIL Image in native resolution."""
+        arr  = np.array(img)                    # (H, W, 3)
+        arr[self._mask] = 0                     # black out masked pixels
+        return Image.fromarray(arr)
+
+
+# Build the shared mask array once at import time (negligible cost)
+TriangleMask._mask = TriangleMask._build_mask()
 
 
 # ============================================================================
@@ -226,8 +279,11 @@ class AIDWindowDataset(Dataset):
               + (f"  (skipped {skipped_short} short sequences)" if skipped_short else ""))
 
         # ── Image transforms ───────────────────────────────────────────────
+        # TriangleMask is applied first (on native 384×640) so the mask
+        # coordinates stay exact before any resize.
         if augment:
             self.transform = transforms.Compose([
+                TriangleMask(),
                 transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
                 transforms.RandomHorizontalFlip(p=0.0),   # horizontal flip OFF
                 # (horizontal flip would invert lane geometry — avoid for traffic)
@@ -240,6 +296,7 @@ class AIDWindowDataset(Dataset):
             ])
         else:
             self.transform = transforms.Compose([
+                TriangleMask(),
                 transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
                 transforms.ToTensor(),
                 transforms.Normalize(NORM_MEAN, NORM_STD),
@@ -422,33 +479,59 @@ class AIDCNNModel:
     @staticmethod
     def _load_scenario_splits() -> Tuple[set, set, set]:
         """
-        Read scenario IDs from the SUMO-generated HDF5 splits.
-        Returns (train_ids, val_ids, test_ids) as sets of strings.
-        This guarantees the CNN uses exactly the same scenario partition
-        as the Random Forest macro model.
-        """
-        print("📂 Loading SUMO HDF5 splits to align scenario IDs...")
-        splits = {}
-        for name, h5_path in [("train", cfg.train_h5), ("val", cfg.val_h5), ("test", cfg.test_h5)]:
-            if not Path(h5_path).exists():
-                raise FileNotFoundError(
-                    f"{name}.h5 not found at {h5_path}\n"
-                    "Run carla_capture.py (or simulation.py) first to generate SUMO data."
-                )
-            df = pd.read_hdf(h5_path, key="data", columns=["scenario_id"])
-            ids = set(df["scenario_id"].unique())
-            splits[name] = ids
-            print(f"  {name:5s}: {len(ids):4d} scenarios")
+        Read scenario IDs from the pre-split metadata CSVs in the dataset folder.
+        train_metadata.csv / val_metadata.csv / test_metadata.csv are written by
+        carla_capture.py's write_split_csvs() and already partitioned by scenario.
 
-        # Sanity: no overlap between splits
+        Falls back to reading the SUMO HDF5 files if the CSVs are absent, so the
+        script works whether you have image data or only macro data.
+
+        Returns (train_ids, val_ids, test_ids) as sets of strings.
+        """
+        csv_paths = {
+            "train": DATASET_DIR / "train_metadata.csv",
+            "val":   DATASET_DIR / "val_metadata.csv",
+            "test":  DATASET_DIR / "test_metadata.csv",
+        }
+        h5_paths = {
+            "train": cfg.train_h5,
+            "val":   cfg.val_h5,
+            "test":  cfg.test_h5,
+        }
+
+        # Prefer the metadata CSVs (lighter, no h5py needed)
+        if all(p.exists() for p in csv_paths.values()):
+            print("📂 Loading scenario splits from metadata CSVs...")
+            splits = {}
+            for name, path in csv_paths.items():
+                df  = pd.read_csv(path, usecols=["scenario_id"])
+                ids = set(df["scenario_id"].unique())
+                splits[name] = ids
+                print(f"  {name:5s}: {len(ids):4d} scenarios  ({path.name})")
+        else:
+            # Fall back to SUMO HDF5 splits
+            print("📂 Metadata CSVs not found — loading from SUMO HDF5 splits...")
+            splits = {}
+            for name, h5_path in h5_paths.items():
+                if not Path(h5_path).exists():
+                    raise FileNotFoundError(
+                        f"{name}.h5 not found at {h5_path}\n"
+                        "Run carla_capture.py (or simulation.py) first to generate SUMO data."
+                    )
+                df  = pd.read_hdf(h5_path, key="data", columns=["scenario_id"])
+                ids = set(df["scenario_id"].unique())
+                splits[name] = ids
+                print(f"  {name:5s}: {len(ids):4d} scenarios")
+
+        # Sanity check: no scenario should appear in more than one split
         overlap_tv = splits["train"] & splits["val"]
         overlap_tt = splits["train"] & splits["test"]
         overlap_vt = splits["val"]   & splits["test"]
         if overlap_tv or overlap_tt or overlap_vt:
             raise RuntimeError(
-                f"Scenario leakage in SUMO splits! "
-                f"train∩val={len(overlap_tv)} "
-                f"train∩test={len(overlap_tt)} "
+                f"Scenario leakage detected in splits! "
+                f"train∩val={len(overlap_tv)}  "
+                f"train∩test={len(overlap_tt)}  "
                 f"val∩test={len(overlap_vt)}"
             )
         print("  ✅ No scenario overlap between splits (no leakage).")
@@ -599,7 +682,9 @@ class AIDCNNModel:
         if remaining_epochs > 0:
             print(f"\n── Phase 2: fine-tune backbone  (up to {remaining_epochs} epochs) ──")
             # Load best phase-1 weights before fine-tuning
-            self.model.load_state_dict(torch.load(best_ckpt, map_location=self.device))
+            self.model.load_state_dict(
+                torch.load(best_ckpt, map_location=self.device, weights_only=True)
+            )
             self.model.unfreeze_last_blocks(n_blocks=3)
             opt2   = self._make_optimizer(phase=2)
             sched2 = ReduceLROnPlateau(opt2, mode="min", factor=0.5, patience=2, verbose=True)
@@ -911,7 +996,7 @@ class AIDCNNModel:
             dropout=self.dropout, n_frames=self.n_frames
         )
         self.model.load_state_dict(
-            torch.load(model_path, map_location=self.device)
+            torch.load(model_path, map_location=self.device, weights_only=True)
         )
         self.model.to(self.device)
         print(f"  ✅ CNN model loaded from {model_path.name}")
@@ -1108,11 +1193,8 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    warnings.filterwarnings("ignore", category=UserWarning)
     train_and_evaluate(
         hp_search     = args.hp_search,
         phase1_only   = args.phase1_only,
         evaluate_only = args.evaluate_only,
     )
-
-    #C:\Users\36302\AppData\Local\Programs\Python\Python38\python.exe cnn_model.py
