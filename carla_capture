@@ -1524,18 +1524,39 @@ def main() -> None:
         "--split-only", action="store_true",
         help="Skip simulation; only rebuild train/val/test split CSVs.",
     )
+    parser.add_argument(
+        "--no-incident-only", action="store_true",
+        help=(
+            "Run ONLY non-incident SUMO scenarios (no CARLA, no incident injection). "
+            "Useful for collecting additional macro detector data without images. "
+            "Output is still written to all_data.h5 in the data folder."
+        ),
+    )
     args = parser.parse_args()
+
+    # ── Overall timer ─────────────────────────────────────────────────────────
+    wall_start = time.time()
 
     if args.split_only:
         write_split_csvs()
+        elapsed = time.time() - wall_start
+        print(f"\n[MAIN] Split rebuild done in {elapsed:.1f}s.")
         return
 
     scenarios = enumerate_scenarios()
+
+    # ── No-incident-only filter ───────────────────────────────────────────────
+    if args.no_incident_only:
+        scenarios = [s for s in scenarios if s["incident_position"] is None]
+        print(f"[MODE] --no-incident-only: keeping {len(scenarios)} non-incident scenarios "
+              f"(incident scenarios skipped).")
+
     if args.limit:
         scenarios = scenarios[: args.limit]
 
-    print(f"[MAIN] Running {len(scenarios)} scenario(s).  dry_run={args.dry_run}")
-    if not args.dry_run:
+    print(f"[MAIN] Running {len(scenarios)} scenario(s).  "
+          f"dry_run={args.dry_run}  no_incident_only={args.no_incident_only}")
+    if not args.dry_run and not args.no_incident_only:
         print()
         print("[CARLA] Before running, start CARLA with this exact command:")
         print(f"  {CARLA_PACKAGED_EXE}"
@@ -1545,11 +1566,17 @@ def main() -> None:
         print("  script will detect it automatically on port 2000.")
         print()
 
-    runner = AIDScenarioRunner(dry_run=args.dry_run)
+    # In no-incident-only mode, force dry_run so CARLA is never started.
+    effective_dry_run = args.dry_run or args.no_incident_only
+    runner = AIDScenarioRunner(dry_run=effective_dry_run)
 
     try:
         for i, sc in enumerate(scenarios, start=1):
-            print(f"\n[MAIN] Scenario {i}/{len(scenarios)}")
+            elapsed_so_far = time.time() - wall_start
+            h, m = divmod(int(elapsed_so_far), 3600)
+            m, s = divmod(m, 60)
+            print(f"\n[MAIN] Scenario {i}/{len(scenarios)}  "
+                  f"(elapsed {h:02d}:{m:02d}:{s:02d})")
             rows = runner.run(**sc)
             _append_master_csv(rows)
     except KeyboardInterrupt:
@@ -1573,10 +1600,12 @@ def main() -> None:
             traci.close()
         except Exception:
             pass
-        import subprocess as _sp
-        _sp.run(["taskkill", "/f", "/im", "CarlaUE4.exe"],
-                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
-        print("[MAIN] Cleanup done (SUMO closed, CarlaUE4 killed if script-launched).")
+        if not args.no_incident_only:
+            import subprocess as _sp
+            _sp.run(["taskkill", "/f", "/im", "CarlaUE4.exe"],
+                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        print("[MAIN] Cleanup done (SUMO closed"
+              + (", CarlaUE4 killed if script-launched" if not args.no_incident_only else "") + ").")
 
     # ── Save all macro data at once ──────────────────────────────────────────
     if runner.all_macro_rows:
@@ -1616,7 +1645,7 @@ def main() -> None:
             n_no_inc    = (df_check["has_incident"] == 0).sum()
             print(f"  Macro HDF5:  {n_rows:,} rows  |  {n_scenarios} scenarios  "
                   f"|  {n_incident} incident rows  |  {n_no_inc} no-incident rows")
-            if n_incident == 0:
+            if not args.no_incident_only and n_incident == 0:
                 issues.append("No incident rows in macro data!")
             if n_no_inc == 0:
                 issues.append("No non-incident rows in macro data!")
@@ -1627,22 +1656,23 @@ def main() -> None:
             issues.append(f"Cannot read macro HDF5: {e}")
     else:
         issues.append("macro HDF5 (all_data.h5) not found!")
-    if MASTER_CSV.exists():
-        import csv as _csv2
-        with open(MASTER_CSV, newline="", encoding="utf-8") as fh:
-            rows_img = list(_csv2.DictReader(fh))
-        n_img = len(rows_img)
-        n_NI   = sum(1 for r in rows_img if r.get("capture_window") == "NI")
-        n_A    = sum(1 for r in rows_img if r.get("capture_window") == "A")
-        n_B    = sum(1 for r in rows_img if r.get("capture_window") == "B")
-        n_scen = len({r["scenario_id"] for r in rows_img})
-        total_label0 = n_NI + n_A
-        print(f"  Image CSV:   {n_img} frames  |  {n_scen} scenarios  "
-              f"|  label=0: {total_label0} (NI={n_NI} + pre={n_A})  |  label=1: {n_B}")
-        if abs(total_label0 - n_B) > n_scen * 2:
-            issues.append(f"Class imbalance: {total_label0} label=0 vs {n_B} label=1")
-    else:
-        issues.append("master_metadata.csv not found - no images captured?")
+    if not args.no_incident_only:
+        if MASTER_CSV.exists():
+            import csv as _csv2
+            with open(MASTER_CSV, newline="", encoding="utf-8") as fh:
+                rows_img = list(_csv2.DictReader(fh))
+            n_img = len(rows_img)
+            n_NI   = sum(1 for r in rows_img if r.get("capture_window") == "NI")
+            n_A    = sum(1 for r in rows_img if r.get("capture_window") == "A")
+            n_B    = sum(1 for r in rows_img if r.get("capture_window") == "B")
+            n_scen = len({r["scenario_id"] for r in rows_img})
+            total_label0 = n_NI + n_A
+            print(f"  Image CSV:   {n_img} frames  |  {n_scen} scenarios  "
+                  f"|  label=0: {total_label0} (NI={n_NI} + pre={n_A})  |  label=1: {n_B}")
+            if abs(total_label0 - n_B) > n_scen * 2:
+                issues.append(f"Class imbalance: {total_label0} label=0 vs {n_B} label=1")
+        else:
+            issues.append("master_metadata.csv not found - no images captured?")
     if issues:
         print("  [!] Issues found:")
         for iss in issues:
@@ -1650,9 +1680,16 @@ def main() -> None:
     else:
         print("  [OK] All checks passed.")
 
+    if not args.no_incident_only:
+        print(f"\n[MAIN] Rebuilding train/val/test split CSVs ...")
+        write_split_csvs()
+
+    # ── Overall elapsed time ──────────────────────────────────────────────────
+    total_elapsed = time.time() - wall_start
+    h, rem = divmod(int(total_elapsed), 3600)
+    m, s   = divmod(rem, 60)
     print(f"\n[MAIN] All done.  Dataset root: {DATASET_DIR}")
-    print(f"[MAIN] Rebuilding train/val/test split CSVs ...")
-    write_split_csvs()
+    print(f"[MAIN] Total wall-clock time: {h:02d}h {m:02d}m {s:02d}s  ({total_elapsed/3600:.2f} hours)")
 
 
 if __name__ == "__main__":
