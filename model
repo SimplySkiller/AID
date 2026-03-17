@@ -200,6 +200,30 @@ class AIDModel:
         y_val = y_val_df.to_numpy(copy=False)
 
         print(f"  Total samples: {len(X_train):,} ({y_train.sum():,} incidents)")
+
+        # ── Guard: both classes must be present ───────────────────────────
+        classes_in_train = np.unique(y_train)
+        classes_in_val   = np.unique(y_val)
+        if len(classes_in_train) < 2:
+            print(
+                f"\n❌ TRAINING DATA ERROR: only class(es) {classes_in_train.tolist()} "
+                f"found in y_train — both 0 and 1 are required.\n"
+                f"\n  Likely cause: you passed a no-incident-only dataset to model.py.\n"
+                f"  The --no-incident-only run in carla_capture.py produces data\n"
+                f"  for TESTING (FAR evaluation), not for training the RF model.\n"
+                f"\n  Fix: run model.py on the original train.h5 / val.h5 that were\n"
+                f"  generated from the full carla_capture.py run (with incidents).\n"
+                f"  Those files are in: {config.data_dir}\n"
+            )
+            raise ValueError(
+                "Training data contains only one class — cannot train a binary classifier. "
+                "See the message above for the fix."
+            )
+        if len(classes_in_val) < 2:
+            print(
+                f"  ⚠️  Validation set contains only class(es) {classes_in_val.tolist()}. "
+                f"Val metrics will be unreliable."
+            )
         
         # 2. SUBSAMPLE SCENARIOS for hyperparameter tuning
         print("\n📉 Subsampling scenarios for hyperparameter tuning...")
@@ -337,7 +361,14 @@ class AIDModel:
         print(f"\n{'='*60}")
         print(f"📊 VALIDATION SET PERFORMANCE")
         print(f"{'='*60}")
-        y_val_proba = self.model.predict_proba(X_val)[:,1] # Validation probabilities
+        y_val_proba = self.model.predict_proba(X_val)
+        # predict_proba returns shape (n,1) if model only saw one class — guard against it
+        if y_val_proba.ndim == 1 or y_val_proba.shape[1] < 2:
+            raise ValueError(
+                "predict_proba returned only one class column on the validation set. "
+                "This means training data had only one class — see the guard above."
+            )
+        y_val_proba = y_val_proba[:, 1]  # positive-class probabilities
         self.select_decision_threshold(X_val, y_val) # Learn threshold from validation set
         self.model.decision_threshold = self.decision_threshold
         y_val_pred = (y_val_proba >= self.decision_threshold).astype(int) # Apply threshold
