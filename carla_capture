@@ -192,18 +192,23 @@ STOP_SEARCH_UPSTREAM = 350.0   # metres upstream of stop target to scan
 MIN_BRAKE_DIST = 60.0    # metres (matched to incident decel=14 m/s²)
 
 # Incident capture timing
-# Window A (pre-incident, label=0): 30s before injection = 60 frames
-# Window B (incident,     label=1): starts at injection,  90s = 180 frames
+# Window A (pre-incident, label=0): 45s before injection = 90 frames  [was 30s/60f]
+# Window B (incident,     label=1): starts at injection, 135s = 270 frames [was 90s/180f]
 # No offset needed: stopped car is guaranteed in frame by zone-based injection.
 #
-# Class balance per scenario pair (1 incident + 1 non-incident):
-#   label=0: 60 (pre) + 120 (non-incident) = 180   <- one non-incident scenario
-#   label=1: 180 (incident window)                   <- one incident scenario
-#   -> 180 vs 180, perfectly balanced across paired scenarios.
-PRE_INCIDENT_WINDOW  = 30.0   # seconds before injection (window A, label=0) = 60 frames
+# 1.5× duration multiplier applied to both windows vs original design.
+# More frames per scenario → more sliding windows → more CNN training samples.
+# Class balance per scenario pair remains perfect because all windows scale together:
+#   label=0: 90 (pre) + 180 (non-incident) = 270   <- one non-incident scenario
+#   label=1: 270 (incident window)                   <- one incident scenario
+#   -> 270 vs 270, perfectly balanced across paired scenarios.
+#
+# The CNN context window (30s = 60 frames) is unchanged — we simply produce more
+# windows per scenario to train and evaluate on.
+PRE_INCIDENT_WINDOW  = 45.0   # seconds before injection (window A, label=0) = 90 frames
 JAM_CAPTURE_OFFSET   = 0.0    # start capturing immediately at injection (car is in frame)
-JAM_CAPTURE_DURATION = 90.0   # seconds of incident capture (window B, label=1) = 180 frames
-NI_CAPTURE_DURATION  = 60.0   # seconds of non-incident capture (label=0)       = 120 frames
+JAM_CAPTURE_DURATION = 135.0  # seconds of incident capture (window B, label=1) = 270 frames
+NI_CAPTURE_DURATION  = 90.0   # seconds of non-incident capture (label=0)       = 180 frames
 
 # CARLA scene loading warmup
 # After start(), tick this many times without saving before opening any capture
@@ -955,12 +960,13 @@ class AIDScenarioRunner:
         all_spawned_vehicles:     set = set()
         steady_state_achieved_time: Optional[float] = None
         carla: Optional[CarlaManager] = None
-        # CARLA starts 60s before incident_start, giving a comfortable pre-incident
-        # buffer of label=0 frames. We capture continuously until window B is full,
-        # then _trim_incident_frames() keeps the last FRAMES_PRE label=0 frames and
-        # the first FRAMES_INCIDENT label=1 frames - always exactly 240 frames total,
-        # with the transition at frame 61 (no gaps between frames 60 and 61).
-        carla_start_t = max(0.0, incident_start - 60.0)
+        # CARLA starts PRE_INCIDENT_WINDOW seconds before incident_start, giving a
+        # comfortable pre-incident buffer of label=0 frames. We capture continuously
+        # until window B is full, then _trim_incident_frames() keeps the last
+        # FRAMES_PRE label=0 frames and the first FRAMES_INCIDENT label=1 frames —
+        # always exactly FRAMES_PRE+FRAMES_INCIDENT frames total (360 at current settings),
+        # with the label transition at frame FRAMES_PRE+1 (no gaps).
+        carla_start_t = max(0.0, incident_start - PRE_INCIDENT_WINDOW)
 
         try:
             while True:
@@ -1728,21 +1734,25 @@ if __name__ == "__main__":
 
 # ── How to run from a terminal (without the Cursor play button) ───────────────
 #
+# IMPORTANT: This script requires Python 3.8 (the CARLA 0.9.10 egg is py3.8 only).
+# Always prefix with  py -3.8  or activate your py3.8 environment first.
+#
 # Standard run (incident + non-incident, full dataset generation):
 #   1. Start CARLA first (paste into a separate terminal):
 #      C:\carla_source\carla\Build\UE4Carla\0.9.10-dirty\WindowsNoEditor\CarlaUE4.exe -quality-level=Low -benchmark -fps=2 -RenderOffScreen -carla-port=2000
+#      (OR press Play in Unreal Editor if using the source build)
 #   2. Wait ~30s for the map to load, then run:
-#      python carla_capture.py
+#      py -3.8 carla_capture.py
 #
 # No-incident-only mode (NI macro + NI images, for testing FAR on real traffic):
-#   1. Start CARLA first (same command as above — CARLA is still needed for images)
-#   2. python carla_capture.py --no-incident-only
+#   1. Start CARLA first (same as above — CARLA is still needed for images)
+#   2. py -3.8 carla_capture.py --no-incident-only
 #
 # Other useful flags:
-#   python carla_capture.py --dry-run              # SUMO only, no CARLA, fast validation
-#   python carla_capture.py --limit 4              # run first 4 scenarios only (smoke test)
-#   python carla_capture.py --no-incident-only --limit 8   # quick NI-only smoke test
-#   python carla_capture.py --split-only           # just rebuild train/val/test CSVs
+#   py -3.8 carla_capture.py --dry-run              # SUMO only, no CARLA, fast validation
+#   py -3.8 carla_capture.py --limit 4              # run first 4 scenarios only (smoke test)
+#   py -3.8 carla_capture.py --no-incident-only --limit 8   # quick NI-only smoke test
+#   py -3.8 carla_capture.py --split-only           # just rebuild train/val/test CSVs
 #
 # Output locations:
 #   Macro HDF5 : data/all_data.h5  (also split to data/train.h5, val.h5, test.h5)
