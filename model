@@ -436,7 +436,7 @@ class AIDModel:
         refined_grid['min_samples_leaf'] = [max(1, min_leaf-1), min_leaf, min_leaf+1]
         
         refined_grid['max_features'] = [best_params['max_features']]
-        refined_grid['class_weight'] = [best_params['class_weight']]
+        # class_weight not included — commented out of rf_param_distributions in config.py
         
         return refined_grid
     
@@ -461,6 +461,11 @@ class AIDModel:
         # Suppress warnings for clean output
         warnings.filterwarnings('ignore')
         
+        # Suppress F-score warnings: at the smallest train-size slices some CV folds
+        # contain no positive samples — the resulting score=0.0 is correct behaviour,
+        # not an error.  The warnings are suppressed here to keep output readable.
+        warnings.filterwarnings('ignore', category=UserWarning)
+
         # =====================================================================
         # 1. LEARNING CURVE
         # =====================================================================
@@ -517,9 +522,9 @@ class AIDModel:
                 min_samples_split=self.best_params['min_samples_split'],
                 min_samples_leaf=self.best_params['min_samples_leaf'],
                 max_features=self.best_params['max_features'],
-                class_weight=self.best_params['class_weight'],
+                # class_weight intentionally omitted — not in rf_param_distributions
                 random_state=config.random_state,
-                n_jobs=1 # Critical
+                n_jobs=1  # Critical: avoid nested parallelism
             ),
             X_diag, y_diag,
             param_name='max_depth',
