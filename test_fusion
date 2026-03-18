@@ -1,0 +1,1112 @@
+"""
+test_fusion.py  –  Dual-model fusion evaluation for AID
+=========================================================
+Tests the Random Forest (macro/SUMO) model and the CNN (micro/CARLA image)
+model separately, then evaluates several fusion strategies that combine both
+models into a single alarm decision.
+
+═══════════════════════════════════════════════════════════════
+ INPUT FOLDER:  C:\\Users\\36302\\Desktop\\Thesis\\I\\test_fusion_input\\
+═══════════════════════════════════════════════════════════════
+
+ Files you must COPY into that folder:
+ ┌─────────────────────────────┬────────────────────────────────────────────┐
+ │ File                        │ Source (from the training pipeline)        │
+ ├─────────────────────────────┼────────────────────────────────────────────┤
+ │ rf_model.pkl                │ models\\rf_model.pkl                       │
+ │ feature_columns.json        │ models\\feature_columns.json               │
+ │ decision_threshold.json     │ models\\decision_threshold.json            │
+ │ cnn_model_final.pt          │ models\\cnn\\cnn_model_final.pt            │
+ │ cnn_meta_final.json         │ models\\cnn\\cnn_meta_final.json           │
+ │ test.h5   ← preferred       │ data\\test.h5  (from full pipeline run)    │
+ │  OR all_data.h5  ← fallback │ data\\all_data.h5  (from --no-incident-    │
+ │                             │   only run, contains only NI scenarios)    │
+ └─────────────────────────────┴────────────────────────────────────────────┘
+
+ Files that are read automatically (do NOT copy — too large):
+ ┌─────────────────────────────┬────────────────────────────────────────────┐
+ │ dataset\\master_metadata.csv │ Written by carla_capture.py               │
+ │ dataset\\sXXXXX\\images\\*.png│ Written by carla_capture.py               │
+ └─────────────────────────────┴────────────────────────────────────────────┘
+
+ NOTE on --no-incident-only compatibility:
+   If you ran carla_capture.py --no-incident-only, place all_data.h5 in the
+   input folder (test.h5 won't exist).  The script detects this automatically.
+   In that case only False Alarm Rate metrics are meaningful (no incidents to
+   detect), but both RF and CNN will still run and fusion rules will be shown.
+
+ NOTE on masking:
+   The same TriangleMask applied during CNN training is applied here
+   automatically (imported from cnn_model.py).  No extra setup needed.
+
+═══════════════════════════════════════════════════════════════
+ OUTPUT FOLDER:  C:\\Users\\36302\\Desktop\\Thesis\\I\\results\\fusion_test\\
+═══════════════════════════════════════════════════════════════
+
+ Fusion strategies evaluated
+ ─────────────────────────────
+   1. RF only          — baseline, macro detector data
+   2. CNN only         — baseline, camera image data
+   3. AND              — alarm only if BOTH models detect (lowest FAR)
+   4. OR               — alarm if EITHER model detects  (highest DR)
+   5. Average prob     — (P_RF + P_CNN) / 2, threshold swept
+   6. Weighted avg     — w·P_RF + (1-w)·P_CNN, w and threshold co-swept
+   7. Max prob         — max(P_RF, P_CNN), threshold swept
+
+ Optimization criterion (matches model.py select_decision_threshold):
+   Maximize DR (detection rate) subject to FAR ≤ MAX_FAR_CONSTRAINT (0.1%).
+   This is operationally realistic: a traffic centre can tolerate at most
+   one false alarm per thousand normal-traffic observations.
+
+ Fusion parameter selection — no leakage
+ ─────────────────────────────────────────
+   The test scenarios are split 50/50 into Fusion-Val and Fusion-Test:
+     • Fusion-Val  (7.5% of total): used to pick w and threshold
+     • Fusion-Test (7.5% of total): locked evaluation, reported in thesis
+   Individual model thresholds (RF, CNN) were already selected during
+   training on their own validation sets and are NOT re-optimized here.
+
+ Evaluation is scenario-level (one detection decision per scenario):
+   DR  = detection rate  = TP / (TP + FN)
+   FAR = false alarm rate = FP / (FP + TN)
+   TTD = median time-to-detection (incident scenarios only)
+"""
+
+from __future__ import annotations
+
+import gc
+import json
+import sys
+import warnings
+import time
+from collections import defaultdict
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
+warnings.filterwarnings("ignore", category=UserWarning)
+
+import joblib
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from sklearn.metrics import (
+    accuracy_score, classification_report, f1_score,
+    precision_score, recall_score, roc_auc_score, roc_curve,
+)
+from tqdm import tqdm
+
+# ── Project paths ─────────────────────────────────────────────────────────────
+_PROJECT = Path(r"C:\Users\36302\Desktop\Thesis\I")
+sys.path.insert(0, str(_PROJECT))
+
+import config as cfg
+from model import FeatureEngineer
+
+# ── CNN imports (masking is part of the dataset, so it's applied automatically)──
+try:
+    import torch
+    from torch.utils.data import DataLoader, Dataset
+    from torchvision import transforms
+    from PIL import Image
+    from cnn_model import (
+        TemporalEfficientNet, AIDWindowDataset, TriangleMask,
+        WINDOW_SIZE, N_FRAMES_WINDOW, WINDOW_STRIDE,
+        IMAGE_SIZE, NORM_MEAN, NORM_STD, DATASET_DIR,
+    )
+    CNN_AVAILABLE = True
+except ImportError as e:
+    print(f"  [WARN] CNN imports failed: {e}")
+    print("  CNN evaluation will be skipped. Install torch+torchvision to enable it.")
+    CNN_AVAILABLE = False
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+INPUT_FOLDER = _PROJECT / "test_fusion_input"
+OUTPUT_DIR   = _PROJECT / "results" / "fusion_test"
+INPUT_FOLDER.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Minimum consecutive positive predictions to declare a scenario "detected"
+MIN_CONFIRMED = 3
+
+# Safety constraint for fusion parameter selection: maximize DR subject to
+# FAR ≤ this value.  Mirrors model.py's select_decision_threshold (0.01%).
+# 0.1% is slightly more lenient to account for the smaller fusion-val set size.
+MAX_FAR_CONSTRAINT = 0.001   # 0.1% false alarm rate ceiling
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 1. File discovery
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def find_input_files() -> dict:
+    """
+    Locate all required and optional files in the input folder.
+    Returns a dict with resolved Path objects (or None for optional missing files).
+    Prints a clear error and exits if a required file is missing.
+    """
+    print(f"\n📁 Scanning input folder: {INPUT_FOLDER}")
+
+    def first(pattern) -> Optional[Path]:
+        hits = sorted(INPUT_FOLDER.glob(pattern))
+        return hits[0] if hits else None
+
+    files = {
+        "rf_model":       first("rf_model*.pkl") or first("*.pkl"),
+        "features":       first("feature_columns*.json"),
+        "rf_threshold":   first("*threshold*.json") or first("decision_threshold*.json"),
+        "cnn_model":      first("cnn_model*.pt"),
+        "cnn_meta":       first("cnn_meta*.json"),
+        # Prefer test.h5; fall back to all_data.h5 (no-incident-only output)
+        "macro_h5":       first("test.h5") or first("all_data.h5") or first("*.h5"),
+    }
+
+    required = ["rf_model", "features", "rf_threshold", "macro_h5"]
+    missing  = [k for k in required if files[k] is None]
+    if missing:
+        print(f"\n❌ Missing required file(s) in {INPUT_FOLDER}:")
+        labels = {
+            "rf_model":     "rf_model.pkl  (from models/rf_model.pkl)",
+            "features":     "feature_columns.json  (from models/feature_columns.json)",
+            "rf_threshold": "decision_threshold.json  (from models/decision_threshold.json)",
+            "macro_h5":     "test.h5 OR all_data.h5  (from data/)",
+        }
+        for k in missing:
+            print(f"   • {labels.get(k, k)}")
+        sys.exit(1)
+
+    no_cnn = [k for k in ["cnn_model", "cnn_meta"] if files[k] is None]
+    if no_cnn:
+        print(f"  ⚠️  CNN model files not found — CNN evaluation will be skipped.")
+        print(f"     To enable: copy models/cnn/cnn_model_final.pt and cnn_meta_final.json")
+
+    h5_name = files["macro_h5"].name
+    mode_note = "(no-incident-only mode fallback)" if h5_name == "all_data.h5" else ""
+    print(f"\n  ✅ RF model:       {files['rf_model'].name}")
+    print(f"  ✅ Features:       {files['features'].name}")
+    print(f"  ✅ RF threshold:   {files['rf_threshold'].name}")
+    print(f"  ✅ Macro data:     {h5_name}  {mode_note}")
+    if files["cnn_model"]:
+        print(f"  ✅ CNN model:      {files['cnn_model'].name}")
+        print(f"  ✅ CNN meta:       {files['cnn_meta'].name}")
+
+    return files
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. RF inference
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_rf_inference(files: dict) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
+    """
+    Load RF model, engineer features, and return per-scenario predictions.
+
+    Returns
+    -------
+    macro_df   : engineered DataFrame (all rows from the H5 file)
+    scen_df    : scenario-level summary  (scenario_id, has_incident, max_prob,
+                 detected, ttd_seconds)
+    threshold  : loaded decision threshold
+    """
+    print("\n" + "="*60)
+    print("  RF MODEL INFERENCE")
+    print("="*60)
+
+    # Load model artifacts
+    model      = joblib.load(files["rf_model"])
+    with open(files["features"])   as f: feature_cols = json.load(f)
+    with open(files["rf_threshold"]) as f: threshold = json.load(f)["threshold"]
+    print(f"  threshold={threshold:.4f}   features={len(feature_cols)}")
+
+    # Load macro data
+    print(f"\n  Loading {files['macro_h5'].name} ...")
+    raw_df = pd.read_hdf(files["macro_h5"], key="data")
+    print(f"  {len(raw_df):,} rows  |  {raw_df['scenario_id'].nunique()} scenarios")
+
+    has_incidents = "incident_active" in raw_df.columns and raw_df["incident_active"].sum() > 0
+    if not has_incidents:
+        print("  ℹ️  No incident rows detected — FAR-only evaluation.")
+
+    # Feature engineering (per-scenario to avoid cross-contamination)
+    print("  Engineering features ...")
+    fe  = FeatureEngineer()
+    eng = fe.engineer_features(raw_df)
+    # Keep only columns the model was trained on
+    missing_feat = [c for c in feature_cols if c not in eng.columns]
+    if missing_feat:
+        print(f"  ⚠️  {len(missing_feat)} feature(s) not found; filling with 0: {missing_feat[:5]}...")
+        for c in missing_feat:
+            eng[c] = 0.0
+
+    X = eng[feature_cols].to_numpy(dtype=np.float32)
+    y = eng["incident_active"].to_numpy() if "incident_active" in eng.columns else np.zeros(len(eng))
+
+    # Predict
+    proba = model.predict_proba(X)[:, 1]
+    eng["rf_prob"]  = proba
+    eng["rf_pred"]  = (proba >= threshold).astype(int)
+    eng["y_true"]   = y
+
+    # ── Scenario-level aggregation ──────────────────────────────────────────
+    scen_rows = []
+    for scen_id, grp in eng.groupby("scenario_id"):
+        grp      = grp.sort_values("sim_time")
+        has_inc  = int(grp["y_true"].max())
+        probs    = grp["rf_prob"].values
+        preds    = grp["rf_pred"].values
+        max_prob = float(probs.max())
+        detected = _check_persistent(preds, MIN_CONFIRMED)
+        ttd      = _compute_ttd(grp, preds, has_inc, "sim_time") if has_inc else None
+        scen_rows.append({
+            "scenario_id": scen_id,
+            "has_incident": has_inc,
+            "rf_max_prob": max_prob,
+            "rf_detected": int(detected),
+            "rf_ttd": ttd,
+        })
+
+    scen_df = pd.DataFrame(scen_rows)
+    print(f"  Scenarios: {len(scen_df)}  "
+          f"(incident={scen_df['has_incident'].sum()}  "
+          f"NI={( scen_df['has_incident']==0).sum()})")
+    return eng, scen_df, threshold
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 3. CNN inference
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_cnn_inference(files: dict, scen_ids: set) -> Optional[pd.DataFrame]:
+    """
+    Load CNN model and run inference on the image windows for the given scenarios.
+
+    Uses AIDWindowDataset from cnn_model.py — masking (TriangleMask) is applied
+    automatically as part of the transform pipeline, exactly as during training.
+
+    Returns a scenario-level DataFrame or None if CNN model files are missing.
+    """
+    if not CNN_AVAILABLE or files["cnn_model"] is None:
+        return None
+
+    print("\n" + "="*60)
+    print("  CNN MODEL INFERENCE")
+    print("="*60)
+
+    # ── Load meta ──────────────────────────────────────────────────────────
+    with open(files["cnn_meta"]) as f:
+        meta = json.load(f)
+    n_frames  = meta["n_frames"]
+    dropout   = meta["dropout"]
+    threshold = meta["decision_threshold"]
+    print(f"  threshold={threshold:.4f}   n_frames={n_frames}   "
+          f"window={meta.get('window_size', WINDOW_SIZE)}  "
+          f"stride={meta.get('window_stride', WINDOW_STRIDE)}")
+
+    # ── Device ────────────────────────────────────────────────────────────
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        mem  = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"  [DEVICE] {name}  ({mem:.1f} GB)")
+    else:
+        print("  [DEVICE] CPU")
+
+    # ── Load CNN ──────────────────────────────────────────────────────────
+    cnn = TemporalEfficientNet(dropout=dropout, n_frames=n_frames)
+    cnn.load_state_dict(
+        torch.load(files["cnn_model"], map_location=device, weights_only=True)
+    )
+    cnn.to(device)
+    cnn.eval()
+    cnn._finetune_mode = False
+    print(f"  Model loaded from {files['cnn_model'].name}")
+
+    # ── Build dataset using the scenario IDs from the H5 file ─────────────
+    # AIDWindowDataset reads master_metadata.csv from the standard dataset/
+    # folder (DATASET_DIR from cnn_model.py) and filters to scen_ids.
+    # TriangleMask is the first step in its transform pipeline.
+    print(f"  Building image windows for {len(scen_ids)} scenarios ...")
+    try:
+        ds = AIDWindowDataset(
+            scenario_ids = scen_ids,
+            split_name   = "inference",
+            n_frames     = n_frames,
+            window_size  = meta.get("window_size", WINDOW_SIZE),
+            stride       = meta.get("window_stride", WINDOW_STRIDE),
+            augment      = False,
+        )
+    except (FileNotFoundError, ValueError) as e:
+        print(f"  ⚠️  Cannot build CNN dataset: {e}")
+        print("  CNN evaluation skipped.")
+        return None
+
+    if len(ds) == 0:
+        print("  ⚠️  No windows found for the given scenario IDs.")
+        return None
+
+    loader = DataLoader(
+        ds, batch_size=8, shuffle=False,
+        num_workers=min(4, 4), pin_memory=True,
+    )
+
+    # ── Run inference ─────────────────────────────────────────────────────
+    all_probs, all_labels = [], []
+    with torch.no_grad():
+        for frames, labels in tqdm(loader, desc="  CNN inference", leave=False):
+            frames = frames.to(device, non_blocking=True)
+            logits = cnn(frames)
+            probs  = torch.sigmoid(logits).cpu().numpy()
+            all_probs.extend(probs.tolist())
+            all_labels.extend(labels.numpy().astype(int).tolist())
+
+    all_probs  = np.array(all_probs)
+    all_labels = np.array(all_labels)
+
+    # ── Scenario-level aggregation ────────────────────────────────────────
+    # Map window index → scenario_id using dataset.windows
+    scen_probs: dict = defaultdict(list)
+    scen_labels: dict = defaultdict(list)
+    for i, (paths, label) in enumerate(ds.windows):
+        # paths[0] is like: .../dataset/sXXXXX/images/frame_000000.png
+        scen_id = Path(paths[0]).parts[-3]
+        scen_probs[scen_id].append(all_probs[i])
+        scen_labels[scen_id].append(label)
+
+    cnn_rows = []
+    for scen_id in scen_probs:
+        probs    = np.array(scen_probs[scen_id])
+        labels   = scen_labels[scen_id]
+        has_inc  = int(max(labels))
+        max_prob = float(probs.max())
+        preds    = (probs >= threshold).astype(int)
+        detected = _check_persistent(preds, MIN_CONFIRMED)
+        # TTD for CNN: window index × stride × 0.5s/frame
+        ttd      = None
+        if has_inc and detected:
+            first_inc_win = next((j for j, l in enumerate(labels) if l == 1), None)
+            first_det_win = int(np.where(preds == 1)[0][0]) if detected else None
+            if first_inc_win is not None and first_det_win is not None:
+                ttd = (first_det_win - first_inc_win) * WINDOW_STRIDE * 0.5
+        cnn_rows.append({
+            "scenario_id": scen_id,
+            "has_incident": has_inc,
+            "cnn_max_prob": max_prob,
+            "cnn_detected": int(detected),
+            "cnn_ttd": ttd,
+        })
+
+    cnn_df = pd.DataFrame(cnn_rows)
+    print(f"  Scenarios with image data: {len(cnn_df)}  "
+          f"(incident={cnn_df['has_incident'].sum()}  "
+          f"NI={(cnn_df['has_incident']==0).sum()})")
+
+    # Clean up GPU memory
+    del cnn, ds, loader
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return cnn_df
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 4. Helper utilities
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _check_persistent(preds: np.ndarray, min_count: int) -> bool:
+    """True if there are at least min_count consecutive positive predictions."""
+    count = 0
+    for p in preds:
+        count = count + 1 if p == 1 else 0
+        if count >= min_count:
+            return True
+    return False
+
+
+def _compute_ttd(
+    grp: pd.DataFrame,
+    preds: np.ndarray,
+    has_inc: int,
+    time_col: str,
+) -> Optional[float]:
+    """Time-to-detection: seconds from incident_active=1 first appearing
+    to first persistent prediction of 1. None if not detected or no incident."""
+    if not has_inc:
+        return None
+    inc_rows = grp[grp["y_true"] == 1]
+    if inc_rows.empty:
+        return None
+    inc_start = float(inc_rows[time_col].iloc[0])
+    consec = 0
+    for idx, (_, row) in enumerate(grp.iterrows()):
+        consec = consec + 1 if preds[idx] == 1 else 0
+        if consec >= MIN_CONFIRMED:
+            return float(row[time_col]) - inc_start
+    return None
+
+
+def _scenario_metrics(
+    scen_df: pd.DataFrame,
+    detected_col: str,
+    label_col: str = "has_incident",
+) -> dict:
+    """Compute TP/FN/FP/TN and derived rates from a scenario-level DataFrame."""
+    tp = int(((scen_df[label_col] == 1) & (scen_df[detected_col] == 1)).sum())
+    fn = int(((scen_df[label_col] == 1) & (scen_df[detected_col] == 0)).sum())
+    fp = int(((scen_df[label_col] == 0) & (scen_df[detected_col] == 1)).sum())
+    tn = int(((scen_df[label_col] == 0) & (scen_df[detected_col] == 0)).sum())
+    dr  = tp / max(tp + fn, 1)
+    far = fp / max(fp + tn, 1)
+    f1  = 2*tp / max(2*tp + fp + fn, 1)
+    return dict(tp=tp, fn=fn, fp=fp, tn=tn,
+                dr=dr, far=far, f1=f1,
+                precision=tp/max(tp+fp,1), recall=dr)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 5. Individual model evaluation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def evaluate_individual(
+    scen_df: pd.DataFrame,
+    model_name: str,
+    detected_col: str,
+    prob_col: str,
+    ttd_col: str,
+    threshold: float,
+) -> dict:
+    m = _scenario_metrics(scen_df, detected_col)
+    has_incidents = scen_df["has_incident"].sum() > 0
+
+    print(f"\n── {model_name} ─────────────────────────────────────")
+    print(f"  threshold={threshold:.4f}")
+    print(f"  TP={m['tp']}  FN={m['fn']}  FP={m['fp']}  TN={m['tn']}")
+    print(f"  Detection Rate : {m['dr']:.2%}")
+    print(f"  False Alarm Rate: {m['far']:.2%}")
+    print(f"  F1 (scenario)  : {m['f1']:.4f}")
+
+    if has_incidents and scen_df[ttd_col].notna().any():
+        med_ttd = scen_df[ttd_col].median()
+        print(f"  Median TTD     : {med_ttd:.1f}s")
+        m["median_ttd"] = float(med_ttd)
+
+    m["model"] = model_name
+    m["threshold"] = threshold
+    return m
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. Fusion methods
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_fusion_evaluation(
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+) -> List[dict]:
+    """
+    Evaluate all fusion strategies with proper val/test separation.
+
+    Parameters
+    ----------
+    val_df  : Fusion-Val scenarios  (used to PICK w and threshold)
+    test_df : Fusion-Test scenarios (used to REPORT final numbers)
+
+    Optimization criterion: maximize DR subject to FAR ≤ MAX_FAR_CONSTRAINT.
+
+    AND and OR use the individual model thresholds that were already chosen
+    during RF/CNN training — no additional parameter selection needed.
+    """
+    print("\n" + "="*60)
+    print("  FUSION EVALUATION")
+    print(f"  Val  : {len(val_df)} scenarios  (parameter selection)")
+    print(f"  Test : {len(test_df)} scenarios  (final reported numbers)")
+    print("="*60)
+
+    has_val_inc  = val_df["has_incident"].sum()  > 0
+    has_test_inc = test_df["has_incident"].sum() > 0
+    results = []
+
+    def _apply_probs(df: pd.DataFrame, w_rf: float) -> pd.DataFrame:
+        """Add fused probability columns to a copy of df."""
+        df = df.copy()
+        df["avg_prob"] = (df["rf_max_prob"] + df["cnn_max_prob"]) / 2
+        df["w_prob"]   = w_rf * df["rf_max_prob"] + (1 - w_rf) * df["cnn_max_prob"]
+        df["max_prob"] = df[["rf_max_prob", "cnn_max_prob"]].max(axis=1)
+        return df
+
+    def _eval(df, col, thr):
+        preds = (df[col] >= thr).astype(int)
+        tp = int(((df["has_incident"] == 1) & (preds == 1)).sum())
+        fn = int(((df["has_incident"] == 1) & (preds == 0)).sum())
+        fp = int(((df["has_incident"] == 0) & (preds == 1)).sum())
+        tn = int(((df["has_incident"] == 0) & (preds == 0)).sum())
+        return dict(tp=tp, fn=fn, fp=fp, tn=tn,
+                    dr=tp/max(tp+fn,1), far=fp/max(fp+tn,1),
+                    f1=2*tp/max(2*tp+fp+fn,1),
+                    precision=tp/max(tp+fp,1), recall=tp/max(tp+fn,1))
+
+    # ── AND (no threshold to select — uses individual model decisions) ────
+    for df in [val_df, test_df]:
+        df["and_detected"] = ((df["rf_detected"]==1) & (df["cnn_detected"]==1)).astype(int)
+        df["or_detected"]  = ((df["rf_detected"]==1) | (df["cnn_detected"]==1)).astype(int)
+
+    for tag, col in [("AND", "and_detected"), ("OR", "or_detected")]:
+        m_test = _scenario_metrics(test_df, col)
+        m_test["model"] = tag
+        m_test["threshold"] = "individual model thresholds"
+        m_test["selected_on"] = "N/A (no free parameters)"
+        results.append(m_test)
+        print(f"\n  {tag:<5}: DR={m_test['dr']:.2%}  FAR={m_test['far']:.2%}  F1={m_test['f1']:.4f}")
+
+    # ── Average prob ──────────────────────────────────────────────────────
+    val_a  = _apply_probs(val_df,  0.5)
+    test_a = _apply_probs(test_df, 0.5)
+    best_avg = _sweep_threshold(val_a, "avg_prob", has_val_inc, MAX_FAR_CONSTRAINT)
+    m_test = _eval(test_a, "avg_prob", best_avg["threshold"])
+    test_a["avg_detected"] = (test_a["avg_prob"] >= best_avg["threshold"]).astype(int)
+    m_test.update(_scenario_metrics(test_a, "avg_detected"))
+    m_test["model"] = "Average prob"
+    m_test["threshold"] = best_avg["threshold"]
+    m_test["selected_on"] = "fusion-val"
+    results.append(m_test)
+    print(f"  Avg  : DR={m_test['dr']:.2%}  FAR={m_test['far']:.2%}  F1={m_test['f1']:.4f}"
+          f"  (thr={best_avg['threshold']:.2f}  selected on val)")
+
+    # ── Weighted avg — sweep w on val_df ──────────────────────────────────
+    print("  Weighted avg sweep on fusion-val ...")
+    best_score  = -np.inf
+    best_w      = 0.5
+    best_w_thr  = 0.5
+
+    for w in np.arange(0.0, 1.01, 0.05):
+        w = round(w, 2)
+        val_w = val_df.copy()
+        val_w["w_prob"] = w * val_w["rf_max_prob"] + (1-w) * val_w["cnn_max_prob"]
+        res = _sweep_threshold(val_w, "w_prob", has_val_inc, MAX_FAR_CONSTRAINT)
+        # Score: DR if FAR constraint met, else penalise
+        score = res["dr"] if res["far"] <= MAX_FAR_CONSTRAINT else -res["far"]
+        if score > best_score:
+            best_score = score
+            best_w     = w
+            best_w_thr = res["threshold"]
+
+    test_w = _apply_probs(test_df, best_w)
+    test_w["w_detected"] = (test_w["w_prob"] >= best_w_thr).astype(int)
+    m_test = _scenario_metrics(test_w, "w_detected")
+    m_test["model"]       = f"Weighted(w_rf={best_w:.2f})"
+    m_test["threshold"]   = best_w_thr
+    m_test["weight_rf"]   = best_w
+    m_test["selected_on"] = "fusion-val"
+    results.append(m_test)
+    print(f"  Wgt  : DR={m_test['dr']:.2%}  FAR={m_test['far']:.2%}  F1={m_test['f1']:.4f}"
+          f"  (w_rf={best_w:.2f}  thr={best_w_thr:.2f}  selected on val)")
+
+    # Attach the selected w/thr to test_df for the weight-sweep plot
+    test_df["w_prob"]   = best_w * test_df["rf_max_prob"] + (1-best_w) * test_df["cnn_max_prob"]
+    val_df["w_prob"]    = best_w * val_df["rf_max_prob"]  + (1-best_w) * val_df["cnn_max_prob"]
+    test_df["avg_prob"] = (test_df["rf_max_prob"] + test_df["cnn_max_prob"]) / 2
+    val_df["avg_prob"]  = (val_df["rf_max_prob"]  + val_df["cnn_max_prob"])  / 2
+    test_df["max_prob"] = test_df[["rf_max_prob","cnn_max_prob"]].max(axis=1)
+    val_df["max_prob"]  = val_df[["rf_max_prob","cnn_max_prob"]].max(axis=1)
+
+    # ── Max prob ──────────────────────────────────────────────────────────
+    best_max = _sweep_threshold(val_df, "max_prob", has_val_inc, MAX_FAR_CONSTRAINT)
+    test_df["max_detected"] = (test_df["max_prob"] >= best_max["threshold"]).astype(int)
+    m_test = _scenario_metrics(test_df, "max_detected")
+    m_test["model"]       = "Max prob"
+    m_test["threshold"]   = best_max["threshold"]
+    m_test["selected_on"] = "fusion-val"
+    results.append(m_test)
+    print(f"  Max  : DR={m_test['dr']:.2%}  FAR={m_test['far']:.2%}  F1={m_test['f1']:.4f}"
+          f"  (thr={best_max['threshold']:.2f}  selected on val)")
+
+    # Store selected params for the weight-sweep plot
+    results[-1]["best_w"]       = best_w
+    results[-1]["best_w_thr"]   = best_w_thr
+
+    return results
+
+
+def _sweep_threshold(
+    df: pd.DataFrame,
+    prob_col: str,
+    has_incidents: bool,
+    max_far: Optional[float] = None,
+) -> dict:
+    """
+    Sweep thresholds 0.02–0.98 and return the best result.
+
+    Optimization criterion (in priority order):
+      1. If max_far is set (safety constraint mode):
+           Maximize DR subject to FAR ≤ max_far.
+           Falls back to lowest-FAR threshold if no threshold satisfies
+           the constraint (e.g. very small val set).
+      2. Else if has_incidents: maximize F1.
+      3. Else (NI-only): minimize FAR.
+
+    Bug-fix note: uses a separate `best_score` float to track the running
+    best, so the NI-mode score (-far, a negative float) is never compared
+    against the f1 field (which is 0 in NI mode) of the stored best dict.
+    """
+    best_score: float = -np.inf
+    best = {"f1": 0.0, "threshold": 0.5, "dr": 0.0, "far": 1.0}
+
+    for thr in np.arange(0.02, 0.99, 0.02):
+        preds = (df[prob_col] >= thr).astype(int)
+        tp = int(((df["has_incident"] == 1) & (preds == 1)).sum())
+        fn = int(((df["has_incident"] == 1) & (preds == 0)).sum())
+        fp = int(((df["has_incident"] == 0) & (preds == 1)).sum())
+        tn = int(((df["has_incident"] == 0) & (preds == 0)).sum())
+        f1  = 2 * tp / max(2 * tp + fp + fn, 1)
+        dr  = tp / max(tp + fn, 1)
+        far = fp / max(fp + tn, 1)
+
+        if max_far is not None:
+            # Safety-constraint mode: maximize DR, discard anything above FAR ceiling
+            score = dr if far <= max_far else -1.0
+        elif has_incidents:
+            score = f1
+        else:
+            score = -far   # NI-only: minimize false alarms
+
+        if score > best_score:
+            best_score = score
+            best = {"f1": f1, "threshold": float(thr), "dr": dr, "far": far}
+
+    return best
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. Plots
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def plot_comparison_bar(
+    rf_m: dict, cnn_m: Optional[dict], fusion_results: List[dict],
+    has_incidents: bool,
+) -> None:
+    """Grouped bar chart comparing DR, FAR, F1 across all models."""
+    all_models = [rf_m]
+    if cnn_m:
+        all_models.append(cnn_m)
+    all_models.extend(fusion_results)
+
+    names = [m["model"] for m in all_models]
+    dr_vals  = [m.get("dr",  0) * 100 for m in all_models]
+    far_vals = [m.get("far", 0) * 100 for m in all_models]
+    f1_vals  = [m.get("f1",  0) * 100 for m in all_models]
+
+    x = np.arange(len(names))
+    w = 0.25
+    fig, ax = plt.subplots(figsize=(max(10, len(names)*1.5), 6))
+    if has_incidents:
+        ax.bar(x - w, dr_vals,  w, label="Detection Rate (%)", color="steelblue")
+    ax.bar(x,     far_vals, w, label="False Alarm Rate (%)", color="tomato")
+    if has_incidents:
+        ax.bar(x + w, f1_vals,  w, label="F1-score (%)",         color="seagreen")
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=20, ha="right")
+    ax.set_ylabel("Percentage (%)")
+    ax.set_title("Model Comparison: RF vs CNN vs Fusion Strategies")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    ax.set_ylim(0, 110)
+    plt.tight_layout()
+    path = OUTPUT_DIR / "comparison_bar.png"
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  💾 Comparison bar chart → {path.name}")
+
+
+def plot_fusion_scatter(joint_df: pd.DataFrame) -> None:
+    """Scatter plot of RF prob vs CNN prob, coloured by true label."""
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ni   = joint_df[joint_df["has_incident"] == 0]
+    inc  = joint_df[joint_df["has_incident"] == 1]
+    ax.scatter(ni["rf_max_prob"],  ni["cnn_max_prob"],
+               alpha=0.5, s=30, c="steelblue", label="No incident")
+    if len(inc):
+        ax.scatter(inc["rf_max_prob"], inc["cnn_max_prob"],
+                   alpha=0.8, s=50, c="tomato", label="Incident", marker="*")
+    ax.set_xlabel("RF max probability")
+    ax.set_ylabel("CNN max probability")
+    ax.set_title("RF vs CNN Scenario-Level Probabilities")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    ax.plot([0, 1], [0, 1], "k--", alpha=0.3, linewidth=1)
+    plt.tight_layout()
+    path = OUTPUT_DIR / "fusion_scatter.png"
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  💾 Fusion scatter plot → {path.name}")
+
+
+def plot_roc_overlay(
+    joint_df: pd.DataFrame, has_incidents: bool,
+) -> None:
+    """ROC curves for RF, CNN, average-prob fusion on the same axes."""
+    if not has_incidents:
+        print("  ⚠️  No incidents — ROC curve skipped.")
+        return
+
+    y = joint_df["has_incident"].values
+    if y.sum() == 0:
+        return
+
+    cols = {
+        "RF":           "rf_max_prob",
+        "CNN":          "cnn_max_prob",
+        "Average prob": "avg_prob",
+        "Max prob":     "max_prob",
+    }
+    existing = {k: v for k, v in cols.items() if v in joint_df.columns}
+
+    plt.figure(figsize=(7, 6))
+    for label, col in existing.items():
+        try:
+            fpr, tpr, _ = roc_curve(y, joint_df[col].values)
+            auc = roc_auc_score(y, joint_df[col].values)
+            plt.plot(fpr, tpr, label=f"{label}  (AUC={auc:.3f})")
+        except Exception:
+            pass
+    plt.plot([0, 1], [0, 1], "k--", alpha=0.4)
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("ROC Curves — Scenario Level")
+    plt.legend(fontsize=9)
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    path = OUTPUT_DIR / "roc_curves.png"
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  💾 ROC curves → {path.name}")
+
+
+def plot_far_vs_threshold(joint_df: pd.DataFrame) -> None:
+    """FAR vs threshold for each fusion probability column."""
+    fig, ax = plt.subplots(figsize=(8, 5))
+    cols = {
+        "RF":           "rf_max_prob",
+        "CNN":          "cnn_max_prob",
+        "Average prob": "avg_prob",
+        "Max prob":     "max_prob",
+    }
+    thresholds = np.arange(0.0, 1.01, 0.02)
+    for label, col in cols.items():
+        if col not in joint_df.columns:
+            continue
+        far_vals = []
+        for thr in thresholds:
+            preds = (joint_df[col] >= thr).astype(int)
+            fp = int(((joint_df["has_incident"] == 0) & (preds == 1)).sum())
+            tn = int(((joint_df["has_incident"] == 0) & (preds == 0)).sum())
+            far_vals.append(fp / max(fp + tn, 1) * 100)
+        ax.plot(thresholds, far_vals, label=label)
+    ax.set_xlabel("Threshold")
+    ax.set_ylabel("False Alarm Rate (%)")
+    ax.set_title("FAR vs Decision Threshold")
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    plt.tight_layout()
+    path = OUTPUT_DIR / "far_vs_threshold.png"
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  💾 FAR vs threshold → {path.name}")
+
+
+def plot_fusion_weight_sweep(
+    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    best_w: float,
+    has_incidents: bool,
+) -> None:
+    """
+    Plot DR and FAR across all RF weights (0.0 → 1.0) evaluated on test_df,
+    with the threshold for each weight chosen on val_df (no leakage).
+
+    The selected best_w is marked with a vertical line. This plot visually
+    justifies the chosen fusion weight for the thesis: it shows the trade-off
+    between DR and FAR as the contribution of each model is varied.
+
+    X-axis: RF weight (0 = CNN only, 1 = RF only)
+    Y-axis: Detection Rate and False Alarm Rate (%)
+    """
+    if not has_incidents:
+        # NI-only mode: only FAR is meaningful
+        weights = np.arange(0.0, 1.01, 0.05)
+        far_vals = []
+        for w in weights:
+            w = round(w, 2)
+            val_tmp = val_df.copy()
+            val_tmp["w_prob"] = w * val_tmp["rf_max_prob"] + (1-w) * val_tmp["cnn_max_prob"]
+            res = _sweep_threshold(val_tmp, "w_prob", False, MAX_FAR_CONSTRAINT)
+            thr = res["threshold"]
+            test_tmp = test_df.copy()
+            test_tmp["w_prob"] = w * test_tmp["rf_max_prob"] + (1-w) * test_tmp["cnn_max_prob"]
+            preds = (test_tmp["w_prob"] >= thr).astype(int)
+            fp = int(((test_tmp["has_incident"] == 0) & (preds == 1)).sum())
+            tn = int(((test_tmp["has_incident"] == 0) & (preds == 0)).sum())
+            far_vals.append(fp / max(fp + tn, 1) * 100)
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.plot(weights, far_vals, color="tomato", linewidth=2, label="FAR (%)")
+        ax.axvline(best_w, color="navy", linestyle="--",
+                   label=f"Selected w_rf={best_w:.2f}")
+        ax.axhline(MAX_FAR_CONSTRAINT * 100, color="gray", linestyle=":",
+                   label=f"FAR constraint ({MAX_FAR_CONSTRAINT*100:.1f}%)")
+        ax.set_xlabel("RF weight  (0 = CNN only,  1 = RF only)")
+        ax.set_ylabel("False Alarm Rate (%)")
+        ax.set_title("Fusion Weight Sweep — FAR vs RF Weight (NI mode)")
+        ax.legend()
+        ax.grid(alpha=0.3)
+    else:
+        weights = np.arange(0.0, 1.01, 0.05)
+        dr_vals, far_vals = [], []
+        for w in weights:
+            w = round(w, 2)
+            val_tmp = val_df.copy()
+            val_tmp["w_prob"] = w * val_tmp["rf_max_prob"] + (1-w) * val_tmp["cnn_max_prob"]
+            res = _sweep_threshold(val_tmp, "w_prob", True, MAX_FAR_CONSTRAINT)
+            thr = res["threshold"]
+            test_tmp = test_df.copy()
+            test_tmp["w_prob"] = w * test_tmp["rf_max_prob"] + (1-w) * test_tmp["cnn_max_prob"]
+            preds = (test_tmp["w_prob"] >= thr).astype(int)
+            tp = int(((test_tmp["has_incident"] == 1) & (preds == 1)).sum())
+            fn = int(((test_tmp["has_incident"] == 1) & (preds == 0)).sum())
+            fp = int(((test_tmp["has_incident"] == 0) & (preds == 1)).sum())
+            tn = int(((test_tmp["has_incident"] == 0) & (preds == 0)).sum())
+            dr_vals.append(tp / max(tp + fn, 1) * 100)
+            far_vals.append(fp / max(fp + tn, 1) * 100)
+
+        fig, ax = plt.subplots(figsize=(9, 5))
+        ax.plot(weights, dr_vals,  color="steelblue", linewidth=2, label="Detection Rate (%)")
+        ax.plot(weights, far_vals, color="tomato",    linewidth=2, label="False Alarm Rate (%)")
+        ax.axvline(best_w, color="navy", linestyle="--",
+                   label=f"Selected w_rf={best_w:.2f}")
+        ax.axhline(MAX_FAR_CONSTRAINT * 100, color="gray", linestyle=":",
+                   label=f"FAR constraint ({MAX_FAR_CONSTRAINT*100:.1f}%)")
+        ax.set_xlabel("RF weight  (0 = CNN only,  1 = RF only)")
+        ax.set_ylabel("Rate (%)")
+        ax.set_title("Fusion Weight Sweep — DR and FAR vs RF Weight\n"
+                     "(threshold selected on fusion-val at each weight)")
+        ax.legend()
+        ax.grid(alpha=0.3)
+        ax.set_ylim(-2, 105)
+
+    plt.tight_layout()
+    path = OUTPUT_DIR / "fusion_weight_sweep.png"
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  💾 Fusion weight sweep → {path.name}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8. Main pipeline
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main() -> None:
+    wall_start = time.time()
+
+    print("\n" + "="*70)
+    print("  AID DUAL-MODEL FUSION EVALUATION")
+    print("="*70)
+    print("\n  This script evaluates the Random Forest (macro) and CNN (micro)")
+    print("  models separately, then tests fusion strategies that combine them.\n")
+
+    # ── 1. Find input files ───────────────────────────────────────────────
+    files = find_input_files()
+
+    # ── 2. RF inference ───────────────────────────────────────────────────
+    macro_eng, rf_scen_df, rf_threshold = run_rf_inference(files)
+    scen_ids = set(rf_scen_df["scenario_id"].unique())
+    has_incidents = rf_scen_df["has_incident"].sum() > 0
+
+    # ── 3. CNN inference ──────────────────────────────────────────────────
+    cnn_scen_df = run_cnn_inference(files, scen_ids) if CNN_AVAILABLE else None
+
+    # ── 4. Individual evaluations ─────────────────────────────────────────
+    print("\n" + "="*60)
+    print("  INDIVIDUAL MODEL RESULTS  (scenario-level)")
+    print("="*60)
+
+    rf_metrics = evaluate_individual(
+        rf_scen_df, "Random Forest (RF)",
+        detected_col="rf_detected", prob_col="rf_max_prob",
+        ttd_col="rf_ttd", threshold=rf_threshold,
+    )
+    rf_metrics["model"] = "RF"
+
+    cnn_metrics = None
+    if cnn_scen_df is not None:
+        cnn_threshold = json.load(open(files["cnn_meta"]))["decision_threshold"]
+        cnn_metrics = evaluate_individual(
+            cnn_scen_df, "CNN (camera)",
+            detected_col="cnn_detected", prob_col="cnn_max_prob",
+            ttd_col="cnn_ttd", threshold=cnn_threshold,
+        )
+        cnn_metrics["model"] = "CNN"
+
+    # ── 5. Fusion ─────────────────────────────────────────────────────────
+    fusion_results = []
+    joint_df = None
+    fusion_val_df = None
+    fusion_test_df = None
+    best_w = 0.5   # default for weight-sweep plot
+
+    if cnn_scen_df is not None:
+        # Join RF and CNN on scenario_id
+        joint_df = rf_scen_df.merge(
+            cnn_scen_df[["scenario_id", "has_incident",
+                         "cnn_max_prob", "cnn_detected", "cnn_ttd"]],
+            on="scenario_id", how="inner", suffixes=("", "_cnn"),
+        )
+        if "has_incident_cnn" in joint_df.columns:
+            joint_df = joint_df.drop(columns=["has_incident_cnn"])
+
+        print(f"\n  Joint scenarios (RF ∩ CNN): {len(joint_df)}")
+
+        # ── Val/Test split for fusion parameters (no leakage) ─────────────
+        # Split joint scenarios 50/50 so fusion weights/thresholds are
+        # selected on fusion_val and reported on fusion_test.
+        # Individual model thresholds (rf_threshold, cnn_threshold) were
+        # already selected during training — NOT re-optimized here.
+        all_scen = joint_df["scenario_id"].values
+        rng_fuse = np.random.default_rng(cfg.random_state)
+        shuffled = rng_fuse.permutation(all_scen)
+        n_val_fuse = max(1, len(shuffled) // 2)
+        val_scen_ids  = set(shuffled[:n_val_fuse])
+        test_scen_ids = set(shuffled[n_val_fuse:])
+        fusion_val_df  = joint_df[joint_df["scenario_id"].isin(val_scen_ids)].copy()
+        fusion_test_df = joint_df[joint_df["scenario_id"].isin(test_scen_ids)].copy()
+
+        print(f"  Fusion-Val  : {len(fusion_val_df)} scenarios  "
+              f"(parameter selection, FAR constraint={MAX_FAR_CONSTRAINT*100:.1f}%)")
+        print(f"  Fusion-Test : {len(fusion_test_df)} scenarios  (final reported numbers)")
+
+        fusion_results = run_fusion_evaluation(fusion_val_df, fusion_test_df)
+
+        # Extract the best w from the weighted result for the plot
+        for r in fusion_results:
+            if "weight_rf" in r:
+                best_w = r["weight_rf"]
+                break
+    else:
+        print("\n  ⚠️  Fusion skipped (CNN model not available).")
+
+    # ── 6. Find best fusion method ────────────────────────────────────────
+    if fusion_results:
+        if has_incidents:
+            best_fus = max(fusion_results, key=lambda x: x["dr"])
+            print(f"\n  🏆 Best fusion (max DR, FAR≤{MAX_FAR_CONSTRAINT*100:.1f}%): "
+                  f"{best_fus['model']}")
+            print(f"     DR={best_fus['dr']:.2%}  FAR={best_fus['far']:.2%}  "
+                  f"F1={best_fus['f1']:.4f}")
+            if "selected_on" in best_fus:
+                print(f"     Parameters selected on: {best_fus['selected_on']}")
+        else:
+            best_fus = min(fusion_results, key=lambda x: x["far"])
+            print(f"\n  🏆 Lowest-FAR fusion  : {best_fus['model']}")
+            print(f"     FAR={best_fus['far']:.2%}  "
+                  f"(no incident data — DR not applicable)")
+
+    # ── 7. Plots ──────────────────────────────────────────────────────────
+    print(f"\n{'='*60}")
+    print("  GENERATING PLOTS")
+    print("="*60)
+
+    plot_comparison_bar(rf_metrics, cnn_metrics, fusion_results, has_incidents)
+
+    if joint_df is not None:
+        plot_fusion_scatter(joint_df)
+        plot_roc_overlay(fusion_test_df, has_incidents)
+        plot_far_vs_threshold(fusion_test_df)
+        plot_fusion_weight_sweep(fusion_val_df, fusion_test_df, best_w, has_incidents)
+
+    # ── 8. Save results JSON ──────────────────────────────────────────────
+    save_payload = {
+        "rf":     rf_metrics,
+        "cnn":    cnn_metrics,
+        "fusion": fusion_results,
+        "has_incidents_in_test_set": bool(has_incidents),
+        "n_scenarios": int(len(rf_scen_df)),
+    }
+    # Remove non-serialisable entries from metrics
+    def clean(d):
+        if d is None:
+            return None
+        return {k: (float(v) if isinstance(v, (np.floating, np.integer)) else v)
+                for k, v in d.items()}
+    save_payload["rf"]  = clean(rf_metrics)
+    save_payload["cnn"] = clean(cnn_metrics)
+    save_payload["fusion"] = [clean(m) for m in fusion_results]
+
+    out_json = OUTPUT_DIR / "fusion_results.json"
+    with open(out_json, "w") as f:
+        json.dump(save_payload, f, indent=2, default=str)
+    print(f"\n  💾 Full results → {out_json}")
+
+    # ── 9. Summary ────────────────────────────────────────────────────────
+    elapsed = time.time() - wall_start
+    h, rem  = divmod(int(elapsed), 3600)
+    m, s    = divmod(rem, 60)
+
+    print(f"\n{'='*70}")
+    print("  SUMMARY")
+    print("="*70)
+    print(f"\n  Test set: {files['macro_h5'].name}  "
+          f"({'incidents present' if has_incidents else 'no incidents — FAR only'})")
+    print(f"  Scenarios evaluated: {len(rf_scen_df)}")
+    if fusion_test_df is not None:
+        print(f"  Fusion-Val / Fusion-Test split: "
+              f"{len(fusion_val_df)} / {len(fusion_test_df)} scenarios")
+        print(f"  Fusion numbers below are from Fusion-Test (unseen during param selection)")
+    print()
+    print(f"  {'Model':<22} {'DR':>8} {'FAR':>8} {'F1':>8}")
+    print(f"  {'-'*50}")
+
+    def fmt(m_dict, has_inc):
+        dr  = f"{m_dict['dr']:.2%}"  if has_inc else "N/A"
+        far = f"{m_dict['far']:.2%}"
+        f1  = f"{m_dict['f1']:.4f}" if has_inc else "N/A"
+        return dr, far, f1
+
+    dr, far, f1 = fmt(rf_metrics, has_incidents)
+    print(f"  {'RF only':<22} {dr:>8} {far:>8} {f1:>8}")
+    if cnn_metrics:
+        dr, far, f1 = fmt(cnn_metrics, has_incidents)
+        print(f"  {'CNN only':<22} {dr:>8} {far:>8} {f1:>8}")
+    for fm in fusion_results:
+        dr, far, f1 = fmt(fm, has_incidents)
+        name = fm["model"][:22]
+        print(f"  {name:<22} {dr:>8} {far:>8} {f1:>8}")
+
+    print(f"\n  Output folder : {OUTPUT_DIR}")
+    print(f"  Elapsed       : {h:02d}h {m:02d}m {s:02d}s")
+    print(f"\n{'='*70}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# How to run
+# ═══════════════════════════════════════════════════════════════════════════════
+# From a terminal (CMD or PowerShell) in the project folder:
+#
+#   python test_fusion.py
+#
+# The script reads from:
+#   C:\Users\36302\Desktop\Thesis\I\test_fusion_input\
+# and writes results to:
+#   C:\Users\36302\Desktop\Thesis\I\results\fusion_test\
+#
+# To test without the CNN (RF only, much faster):
+#   Simply do not place cnn_model_final.pt / cnn_meta_final.json in the
+#   input folder.  The script will run RF only and skip fusion.
+#
+# If you used --no-incident-only mode in carla_capture.py:
+#   Place all_data.h5 (not test.h5) in the input folder.
+#   Only FAR metrics will be meaningful (no incidents to detect).
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    main()
