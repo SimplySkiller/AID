@@ -182,9 +182,12 @@ STOP_BEFORE_DET3_START = 1900.0         # SUMO cartesian x where before_det3 sta
 STOP_DET3_START        = 2400.0         # SUMO cartesian x where det3 starts
 
 # How far upstream to search for a vehicle to stop (SUMO cartesian x).
-# The search window [stop_x-350, stop_x-60] gives a large candidate pool
-# across the full stop zone (2360-2480).
-STOP_SEARCH_UPSTREAM = 350.0   # metres upstream of stop target to scan
+# At minimum flow (200 veh/h = 0.056 veh/s per lane) and 36 m/s, mean headway is
+# 36/0.056 ≈ 648m. A search window shorter than this means some ticks see zero
+# candidates in sparse traffic. 700m guarantees at least one vehicle in range at
+# any flow ≥ 200 veh/h. SUMO still rejects the setStop if truly too close — the
+# wider window only increases the candidate pool, it does not bypass physics.
+STOP_SEARCH_UPSTREAM = 700.0   # metres upstream of stop target to scan
 
 # Minimum distance from stop point to issue setStop without "too close to brake".
 # With incident decel=14 m/s² and max speed 36 m/s: s = 36^2/(2*14) = 46m.
@@ -910,8 +913,23 @@ class AIDScenarioRunner:
         img_dir    = DATASET_DIR / scen_label / "images"
         img_dir.mkdir(parents=True, exist_ok=True)
 
-        # Skip already-completed scenarios so re-runs are safe.
+        # ── Clean up orphaned images from a previous failed injection attempt ──
+        # If a previous run was killed mid-scenario (or ran an older code version
+        # with a 600s timeout), there may be image files with no metadata.csv.
+        # Detect this and purge the orphans so CARLA starts with a clean slate.
         scen_csv = DATASET_DIR / scen_label / "metadata.csv"
+        if not scen_csv.exists():
+            orphans = list(img_dir.glob("frame_*.png"))
+            if orphans:
+                print(f"  [CLEANUP] {scen_label}: removing {len(orphans)} orphaned PNGs "
+                      f"from a previous failed run ...")
+                for png in orphans:
+                    try:
+                        png.unlink()
+                    except Exception:
+                        pass
+
+        # Skip already-completed scenarios so re-runs are safe.
         if scen_csv.exists():
             import csv as _csv
             with open(scen_csv, newline="", encoding="utf-8") as fh:
@@ -956,6 +974,7 @@ class AIDScenarioRunner:
         injection_failed          = False
         actual_inject_time        = None
         actual_stop_time          = None   # when speed < 1 m/s after injection
+        _eff_min_brake            = MIN_BRAKE_DIST  # may be relaxed after 300s of waiting
         completed_vehicles:       set = set()
         all_spawned_vehicles:     set = set()
         steady_state_achieved_time: Optional[float] = None
@@ -1026,7 +1045,9 @@ class AIDScenarioRunner:
                         effective_stop_edge = "det3"
                         stop_lane_pos = stop_x - STOP_DET3_START
                     search_min_x  = stop_x - STOP_SEARCH_UPSTREAM
-                    # Corrected edge_starts (SUMO cartesian x from highway_net.xml shapes):
+                    # Corrected edge_starts (SUMO cartesian x from highway_net.xml shapes).
+                    # With STOP_SEARCH_UPSTREAM=700m the window may reach before_det2 or
+                    # even det2 for the farthest stop positions — all are included here.
                     edge_starts   = {
                         "before_det1": 0.0,     "det1":        1200.0,
                         "before_det2": 1300.0,  "det2":        1800.0,
@@ -1045,8 +1066,10 @@ class AIDScenarioRunner:
                             lane_pos = traci.vehicle.getLanePosition(vid)
                             abs_x    = edge_starts[edge] + lane_pos
                             dist_to_stop = stop_x - abs_x
-                            # Must be upstream and have enough room to brake
-                            if MIN_BRAKE_DIST <= dist_to_stop <= STOP_SEARCH_UPSTREAM:
+                            # Must be upstream and have enough room to brake.
+                            # _eff_min_brake starts at MIN_BRAKE_DIST and may be
+                            # relaxed to 50m after 300s of fruitless searching.
+                            if _eff_min_brake <= dist_to_stop <= STOP_SEARCH_UPSTREAM:
                                 candidates.append((vid, abs_x, dist_to_stop))
                         except Exception:
                             continue
@@ -1099,17 +1122,20 @@ class AIDScenarioRunner:
                         incident_injection_attempts += 1
 
                     if not incident_injected:
-                        if incident_injection_attempts % 100 == 0:
+                        if incident_injection_attempts % 200 == 0:
                             print(f"  [WAIT] t={t:.0f}s  no suitable vehicle "
-                                  f"[{MIN_BRAKE_DIST:.0f}-{STOP_SEARCH_UPSTREAM:.0f}]m "
-                                  f"upstream of x={stop_x:.0f}m...", end="\r")
-                        if t > incident_start + 600:
-                            reason_disc = (f"no vehicle with >={MIN_BRAKE_DIST:.0f}m brake room "
-                                           f"upstream of x={stop_x:.0f}m after 600s")
-                            self.discarded_scenarios.append((scen_label, reason_disc))
-                            print(f"\n[DISCARD] {scen_label}: {reason_disc}.")
-                            injection_failed = True
-                            break
+                                  f"[{_eff_min_brake:.0f}-{STOP_SEARCH_UPSTREAM:.0f}]m "
+                                  f"upstream of x={stop_x:.0f}m "
+                                  f"(attempts={incident_injection_attempts})...", end="\r")
+                        # After 300s of searching, relax the minimum brake distance.
+                        # Theoretical minimum at 14 m/s² from 36 m/s = 46m; 50m adds 4m margin.
+                        # This lets us catch cars that are slightly closer to the stop point
+                        # in very sparse traffic — SUMO still rejects truly-too-close candidates
+                        # per try-except in the injection loop, so nothing breaks.
+                        if t > incident_start + 300 and _eff_min_brake > 50.0:
+                            _eff_min_brake = 50.0
+                            print(f"\n  [RELAX] t={t:.0f}s — 300s elapsed, "
+                                  f"relaxing min brake distance to {_eff_min_brake:.0f}m")
 
                 # ── Track when vehicle actually comes to a full stop ─────────────
                 if incident_injected and actual_stop_time is None and incident_vehicle:
@@ -1251,12 +1277,34 @@ class AIDScenarioRunner:
                 except PermissionError:
                     time.sleep(0.5)
 
-        # Discard everything if incident injection failed
+        # Detect failed injection: sim loop exited naturally without ever injecting.
+        # This happens when the flow is so sparse that no vehicle entered the search zone
+        # before sim_end was reached.
+        if not incident_injected and not injection_failed:
+            injection_failed = True
+            reason_disc = (f"sim ended at t≈{sim_end:.0f}s without finding a vehicle "
+                           f">={_eff_min_brake:.0f}m upstream of x={incident_position:.0f}m "
+                           f"(flow={flow_total} veh/h is very sparse)")
+            self.discarded_scenarios.append((scen_label, reason_disc))
+            print(f"\n[DISCARD] {scen_label}: {reason_disc}.")
+
+        # Discard everything if incident injection failed (sim ended without finding a vehicle)
         if injection_failed:
             self.sumo.log_data = []
-            reason = f"injection failed: no vehicle near pos={incident_position:.0f}m after 60 retries"
-            self.discarded_scenarios.append((scen_label, reason))
-            print(f"[DISCARD] {scen_label}: {reason}.")
+            # Note: the first discard entry was already added inside the simulation loop
+            # when the timeout fired.  Don't add a second one — just clean up and return.
+            print(f"[DISCARD] {scen_label}: cleaning up {frame_id} orphaned images ...")
+            # Delete images that accumulated during the failed injection search so they
+            # don't occupy disk space and can't confuse a re-run's skip-if-exists check.
+            deleted = 0
+            for png in img_dir.glob("frame_*.png"):
+                try:
+                    png.unlink()
+                    deleted += 1
+                except Exception:
+                    pass
+            if deleted:
+                print(f"  Deleted {deleted} orphaned PNG files from {img_dir.name}/images/")
             return []
 
         # Accumulate macro data
