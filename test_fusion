@@ -137,6 +137,9 @@ MIN_CONFIRMED = 3
 # 0.1% is slightly more lenient to account for the smaller fusion-val set size.
 MAX_FAR_CONSTRAINT = 0.001   # 0.1% false alarm rate ceiling
 
+# Persistent settings file written during calibration, read during evaluation.
+FUSION_SETTINGS_PATH = INPUT_FOLDER / "fusion_settings.json"
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1. File discovery
@@ -160,8 +163,12 @@ def find_input_files() -> dict:
         "rf_threshold":   first("*threshold*.json") or first("decision_threshold*.json"),
         "cnn_model":      first("cnn_model*.pt"),
         "cnn_meta":       first("cnn_meta*.json"),
-        # Prefer test.h5; fall back to all_data.h5 (no-incident-only output)
-        "macro_h5":       first("test.h5") or first("all_data.h5") or first("*.h5"),
+        # Detection order determines mode:
+        #   val.h5      → CALIBRATION  (sweep + save fusion_settings.json)
+        #   test.h5     → EVALUATION   (load fusion_settings.json, apply locked params)
+        #   all_data.h5 → EVALUATION   (NI set, FAR only, load locked params)
+        "macro_h5": (first("val.h5") or first("test.h5")
+                     or first("all_data.h5") or first("*.h5")),
     }
 
     required = ["rf_model", "features", "rf_threshold", "macro_h5"]
@@ -184,7 +191,8 @@ def find_input_files() -> dict:
         print(f"     To enable: copy models/cnn/cnn_model_final.pt and cnn_meta_final.json")
 
     h5_name = files["macro_h5"].name
-    mode_note = "(no-incident-only mode fallback)" if h5_name == "all_data.h5" else ""
+    mode = _determine_mode(h5_name)
+    mode_note = f"→ {mode.upper()} MODE"
     print(f"\n  ✅ RF model:       {files['rf_model'].name}")
     print(f"  ✅ Features:       {files['features'].name}")
     print(f"  ✅ RF threshold:   {files['rf_threshold'].name}")
@@ -903,6 +911,83 @@ def plot_fusion_weight_sweep(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 7b. Calibration / Evaluation mode helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _determine_mode(h5_name: str) -> str:
+    """
+    Return 'calibration' if the input is val.h5, else 'evaluation'.
+
+    calibration : sweep w and threshold on the data, save fusion_settings.json
+    evaluation  : load fusion_settings.json, apply locked params, no sweep
+    """
+    return "calibration" if h5_name == "val.h5" else "evaluation"
+
+
+def run_fusion_evaluation_locked(
+    joint_df: pd.DataFrame,
+    settings: dict,
+) -> List[dict]:
+    """
+    Apply fusion strategies using parameters locked in fusion_settings.json.
+    No sweeping — each strategy uses the threshold saved during calibration.
+
+    AND and OR still use individual model thresholds (no free parameters).
+    Weighted, Average, and Max use their saved thresholds from calibration.
+    """
+    print("\n" + "="*60)
+    print("  FUSION EVALUATION  (locked parameters from calibration)")
+    print(f"  w_rf={settings['w_rf']:.2f}  "
+          f"thresholds: avg={settings['thresholds']['avg_prob']:.2f}  "
+          f"weighted={settings['thresholds']['w_prob']:.2f}  "
+          f"max={settings['thresholds']['max_prob']:.2f}")
+    print("="*60)
+
+    results = []
+
+    # Pre-compute fused probability columns
+    w = settings["w_rf"]
+    joint_df = joint_df.copy()
+    joint_df["avg_prob"] = (joint_df["rf_max_prob"] + joint_df["cnn_max_prob"]) / 2
+    joint_df["w_prob"]   = w * joint_df["rf_max_prob"] + (1-w) * joint_df["cnn_max_prob"]
+    joint_df["max_prob"] = joint_df[["rf_max_prob", "cnn_max_prob"]].max(axis=1)
+
+    # AND / OR — no threshold to lock
+    for tag, col in [("AND", "and_detected"), ("OR", "or_detected")]:
+        if tag == "AND":
+            joint_df[col] = (
+                (joint_df["rf_detected"] == 1) & (joint_df["cnn_detected"] == 1)
+            ).astype(int)
+        else:
+            joint_df[col] = (
+                (joint_df["rf_detected"] == 1) | (joint_df["cnn_detected"] == 1)
+            ).astype(int)
+        m = _scenario_metrics(joint_df, col)
+        m["model"] = tag
+        m["threshold"] = "individual model thresholds"
+        results.append(m)
+        print(f"\n  {tag:<5}: DR={m['dr']:.2%}  FAR={m['far']:.2%}  F1={m['f1']:.4f}")
+
+    # Average prob, Weighted, Max — use locked thresholds
+    for tag, prob_col, thr_key, extra in [
+        ("Average prob",              "avg_prob", "avg_prob", {}),
+        (f"Weighted(w_rf={w:.2f})",   "w_prob",   "w_prob",  {"weight_rf": w}),
+        ("Max prob",                  "max_prob",  "max_prob", {}),
+    ]:
+        thr = settings["thresholds"][thr_key]
+        joint_df[f"{prob_col}_det"] = (joint_df[prob_col] >= thr).astype(int)
+        m = _scenario_metrics(joint_df, f"{prob_col}_det")
+        m["model"]     = tag
+        m["threshold"] = thr
+        m.update(extra)
+        results.append(m)
+        print(f"  {tag[:22]:<22}: DR={m['dr']:.2%}  FAR={m['far']:.2%}  "
+              f"F1={m['f1']:.4f}  (thr={thr:.2f}  locked)")
+
+    return results, joint_df
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 8. Main pipeline
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -917,6 +1002,16 @@ def main() -> None:
 
     # ── 1. Find input files ───────────────────────────────────────────────
     files = find_input_files()
+    mode = _determine_mode(files["macro_h5"].name)
+
+    print(f"\n  {'─'*50}")
+    if mode == "calibration":
+        print(f"  MODE: CALIBRATION  (val.h5 detected)")
+        print(f"  Will sweep fusion parameters and save to fusion_settings.json")
+    else:
+        print(f"  MODE: EVALUATION  ({files['macro_h5'].name} detected)")
+        print(f"  Will load locked parameters from fusion_settings.json")
+    print(f"  {'─'*50}")
 
     # ── 2. RF inference ───────────────────────────────────────────────────
     macro_eng, rf_scen_df, rf_threshold = run_rf_inference(files)
@@ -956,7 +1051,7 @@ def main() -> None:
     best_w = 0.5   # default for weight-sweep plot
 
     if cnn_scen_df is not None:
-        # Join RF and CNN on scenario_id
+        # Build joint DataFrame
         joint_df = rf_scen_df.merge(
             cnn_scen_df[["scenario_id", "has_incident",
                          "cnn_max_prob", "cnn_detected", "cnn_ttd"]],
@@ -967,31 +1062,66 @@ def main() -> None:
 
         print(f"\n  Joint scenarios (RF ∩ CNN): {len(joint_df)}")
 
-        # ── Val/Test split for fusion parameters (no leakage) ─────────────
-        # Split joint scenarios 50/50 so fusion weights/thresholds are
-        # selected on fusion_val and reported on fusion_test.
-        # Individual model thresholds (rf_threshold, cnn_threshold) were
-        # already selected during training — NOT re-optimized here.
-        all_scen = joint_df["scenario_id"].values
-        rng_fuse = np.random.default_rng(cfg.random_state)
-        shuffled = rng_fuse.permutation(all_scen)
-        n_val_fuse = max(1, len(shuffled) // 2)
-        val_scen_ids  = set(shuffled[:n_val_fuse])
-        test_scen_ids = set(shuffled[n_val_fuse:])
-        fusion_val_df  = joint_df[joint_df["scenario_id"].isin(val_scen_ids)].copy()
-        fusion_test_df = joint_df[joint_df["scenario_id"].isin(test_scen_ids)].copy()
+        if mode == "calibration":
+            # ── CALIBRATION: sweep on fusion-val, evaluate on fusion-test ───
+            all_scen = joint_df["scenario_id"].values
+            rng_fuse = np.random.default_rng(cfg.random_state)
+            shuffled = rng_fuse.permutation(all_scen)
+            n_val_fuse = max(1, len(shuffled) // 2)
+            val_scen_ids  = set(shuffled[:n_val_fuse])
+            test_scen_ids = set(shuffled[n_val_fuse:])
+            fusion_val_df  = joint_df[joint_df["scenario_id"].isin(val_scen_ids)].copy()
+            fusion_test_df = joint_df[joint_df["scenario_id"].isin(test_scen_ids)].copy()
 
-        print(f"  Fusion-Val  : {len(fusion_val_df)} scenarios  "
-              f"(parameter selection, FAR constraint={MAX_FAR_CONSTRAINT*100:.1f}%)")
-        print(f"  Fusion-Test : {len(fusion_test_df)} scenarios  (final reported numbers)")
+            print(f"  Fusion-Val  : {len(fusion_val_df)} scenarios  "
+                  f"(parameter selection, FAR constraint={MAX_FAR_CONSTRAINT*100:.1f}%)")
+            print(f"  Fusion-Test : {len(fusion_test_df)} scenarios  (final reported numbers)")
 
-        fusion_results = run_fusion_evaluation(fusion_val_df, fusion_test_df)
+            fusion_results = run_fusion_evaluation(fusion_val_df, fusion_test_df)
 
-        # Extract the best w from the weighted result for the plot
-        for r in fusion_results:
-            if "weight_rf" in r:
-                best_w = r["weight_rf"]
-                break
+            # Extract best w and thresholds from sweep results, save to JSON
+            settings_to_save = {"w_rf": 0.5, "thresholds": {
+                "avg_prob": 0.5, "w_prob": 0.5, "max_prob": 0.5,
+            }}
+            for r in fusion_results:
+                if "weight_rf" in r:
+                    settings_to_save["w_rf"] = float(r["weight_rf"])
+                    settings_to_save["thresholds"]["w_prob"] = float(r["threshold"])
+                    best_w = r["weight_rf"]
+                if r["model"] == "Average prob":
+                    settings_to_save["thresholds"]["avg_prob"] = float(r["threshold"])
+                if r["model"] == "Max prob":
+                    settings_to_save["thresholds"]["max_prob"] = float(r["threshold"])
+
+            with open(FUSION_SETTINGS_PATH, "w") as f:
+                json.dump(settings_to_save, f, indent=2)
+            print(f"\n  💾 Fusion settings saved → {FUSION_SETTINGS_PATH.name}")
+            print(f"     w_rf={settings_to_save['w_rf']:.2f}  "
+                  f"thresholds={settings_to_save['thresholds']}")
+
+        else:
+            # ── EVALUATION: load locked parameters, no sweep ─────────────
+            if not FUSION_SETTINGS_PATH.exists():
+                print(f"\n❌ Calibration required: Please run with val.h5 first.")
+                print(f"   Expected settings file: {FUSION_SETTINGS_PATH}")
+                print(f"   Steps:")
+                print(f"     1. Place val.h5 in {INPUT_FOLDER.name}/")
+                print(f"     2. Run: python test_fusion.py")
+                print(f"     3. Then replace val.h5 with {files['macro_h5'].name} and re-run.")
+                sys.exit(1)
+
+            with open(FUSION_SETTINGS_PATH) as f:
+                settings = json.load(f)
+            print(f"\n  ✅ Loaded fusion_settings.json  "
+                  f"(w_rf={settings['w_rf']:.2f})")
+
+            fusion_results, joint_df = run_fusion_evaluation_locked(joint_df, settings)
+            best_w = settings["w_rf"]
+            # In evaluation mode both val and test are the full joint_df
+            # (no split — parameters are already locked from calibration)
+            fusion_val_df  = joint_df
+            fusion_test_df = joint_df
+
     else:
         print("\n  ⚠️  Fusion skipped (CNN model not available).")
 
@@ -1022,7 +1152,8 @@ def main() -> None:
         plot_fusion_scatter(joint_df)
         plot_roc_overlay(fusion_test_df, has_incidents)
         plot_far_vs_threshold(fusion_test_df)
-        plot_fusion_weight_sweep(fusion_val_df, fusion_test_df, best_w, has_incidents)
+        if mode == "calibration":
+            plot_fusion_weight_sweep(fusion_val_df, fusion_test_df, best_w, has_incidents)
 
     # ── 8. Save results JSON ──────────────────────────────────────────────
     save_payload = {
@@ -1055,13 +1186,16 @@ def main() -> None:
     print(f"\n{'='*70}")
     print("  SUMMARY")
     print("="*70)
-    print(f"\n  Test set: {files['macro_h5'].name}  "
+    print(f"\n  Mode      : {mode.upper()}")
+    print(f"  Test set  : {files['macro_h5'].name}  "
           f"({'incidents present' if has_incidents else 'no incidents — FAR only'})")
     print(f"  Scenarios evaluated: {len(rf_scen_df)}")
-    if fusion_test_df is not None:
+    if mode == "calibration" and fusion_test_df is not None:
         print(f"  Fusion-Val / Fusion-Test split: "
               f"{len(fusion_val_df)} / {len(fusion_test_df)} scenarios")
         print(f"  Fusion numbers below are from Fusion-Test (unseen during param selection)")
+    elif mode == "evaluation":
+        print(f"  Fusion parameters locked from: {FUSION_SETTINGS_PATH.name}")
     print()
     print(f"  {'Model':<22} {'DR':>8} {'FAR':>8} {'F1':>8}")
     print(f"  {'-'*50}")
@@ -1088,24 +1222,33 @@ def main() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# How to run
+# How to run — Calibration → Evaluation workflow
 # ═══════════════════════════════════════════════════════════════════════════════
-# From a terminal (CMD or PowerShell) in the project folder:
 #
-#   python test_fusion.py
+# STEP 1 — CALIBRATION  (run once to select fusion parameters)
+#   1. Copy val.h5 into the input folder (test_fusion_input/)
+#   2. python test_fusion.py
+#   → Sweeps w and threshold on fusion-val, evaluates on fusion-test (both
+#     halves of val.h5).  Saves fusion_settings.json to the input folder.
 #
-# The script reads from:
-#   C:\Users\36302\Desktop\Thesis\I\test_fusion_input\
-# and writes results to:
-#   C:\Users\36302\Desktop\Thesis\I\results\fusion_test\
+# STEP 2 — EVALUATION on test.h5  (incident scenarios, final thesis numbers)
+#   1. Remove val.h5 from the input folder.
+#   2. Copy test.h5 into the input folder.
+#   3. python test_fusion.py
+#   → Loads fusion_settings.json, applies locked w and thresholds.
+#     Reports DR, FAR, F1 — these are the numbers for your thesis.
+#
+# STEP 3 — EVALUATION on all_data.h5  (NI set, FAR robustness check)
+#   1. Remove test.h5 from the input folder.
+#   2. Copy all_data.h5 (from --no-incident-only run) into the input folder.
+#   3. python test_fusion.py
+#   → Loads the same fusion_settings.json, reports FAR only (DR = N/A).
+#     This confirms the locked parameters don't trigger false alarms on
+#     real normal traffic.
 #
 # To test without the CNN (RF only, much faster):
 #   Simply do not place cnn_model_final.pt / cnn_meta_final.json in the
 #   input folder.  The script will run RF only and skip fusion.
-#
-# If you used --no-incident-only mode in carla_capture.py:
-#   Place all_data.h5 (not test.h5) in the input folder.
-#   Only FAR metrics will be meaningful (no incidents to detect).
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
