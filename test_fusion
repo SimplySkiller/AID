@@ -665,6 +665,10 @@ def _sweep_threshold(
     """
     best_score: float = -np.inf
     best = {"f1": 0.0, "threshold": 0.5, "dr": 0.0, "far": 1.0}
+    # Fallback used when NO threshold satisfies the FAR constraint:
+    # return the threshold that achieves the absolute lowest FAR.
+    fallback_score: float = np.inf
+    fallback = {"f1": 0.0, "threshold": 0.98, "dr": 0.0, "far": 1.0}
 
     for thr in np.arange(0.02, 0.99, 0.02):
         preds = (df[prob_col] >= thr).astype(int)
@@ -679,6 +683,10 @@ def _sweep_threshold(
         if max_far is not None:
             # Safety-constraint mode: maximize DR, discard anything above FAR ceiling
             score = dr if far <= max_far else -1.0
+            # Track lowest-FAR option as fallback
+            if far < fallback_score:
+                fallback_score = far
+                fallback = {"f1": f1, "threshold": float(thr), "dr": dr, "far": far}
         elif has_incidents:
             score = f1
         else:
@@ -687,6 +695,17 @@ def _sweep_threshold(
         if score > best_score:
             best_score = score
             best = {"f1": f1, "threshold": float(thr), "dr": dr, "far": far}
+
+    # If constraint mode found no valid threshold, warn and use lowest-FAR fallback
+    if max_far is not None and best_score <= -1.0:
+        import warnings as _w
+        _w.warn(
+            f"No threshold for '{prob_col}' satisfies FAR≤{max_far*100:.2f}%. "
+            f"Using lowest-FAR fallback (thr={fallback['threshold']:.2f}, "
+            f"FAR={fallback['far']:.2%}, DR={fallback['dr']:.2%}).",
+            stacklevel=2,
+        )
+        return fallback
 
     return best
 
@@ -1097,9 +1116,14 @@ def main() -> None:
 
             with open(FUSION_SETTINGS_PATH, "w") as f:
                 json.dump(settings_to_save, f, indent=2)
-            print(f"\n  💾 Fusion settings saved → {FUSION_SETTINGS_PATH.name}")
+            existed = "overwritten" if FUSION_SETTINGS_PATH.exists() else "created"
+            print(f"\n  💾 fusion_settings.json {existed} → {FUSION_SETTINGS_PATH.name}")
             print(f"     w_rf={settings_to_save['w_rf']:.2f}  "
                   f"thresholds={settings_to_save['thresholds']}")
+            print(f"\n  ℹ️  ALL fusion strategies (AND, OR, Avg, Weighted, Max) are saved.")
+            print(f"     In evaluation mode, every strategy is re-evaluated independently")
+            print(f"     on the new data set using its locked threshold. The winner is")
+            print(f"     picked fresh — a calibration tie does not carry over.")
 
         else:
             # ── EVALUATION: load locked parameters, no sweep ─────────────
@@ -1116,6 +1140,7 @@ def main() -> None:
                 settings = json.load(f)
             print(f"\n  ✅ Loaded fusion_settings.json  "
                   f"(w_rf={settings['w_rf']:.2f})")
+            print(f"     All strategies evaluated on this data — winner picked fresh.")
 
             fusion_results, joint_df = run_fusion_evaluation_locked(joint_df, settings)
             best_w = settings["w_rf"]
@@ -1130,7 +1155,16 @@ def main() -> None:
     # ── 6. Find best fusion method ────────────────────────────────────────
     if fusion_results:
         if has_incidents:
-            best_fus = max(fusion_results, key=lambda x: x["dr"])
+            # Only consider methods that satisfy the FAR constraint.
+            # Tiebreak: highest DR first, then highest F1.
+            constrained = [r for r in fusion_results if r["far"] <= MAX_FAR_CONSTRAINT]
+            if constrained:
+                best_fus = max(constrained, key=lambda x: (x["dr"], x["f1"]))
+            else:
+                # No method satisfies the constraint — pick lowest FAR overall
+                best_fus = min(fusion_results, key=lambda x: x["far"])
+                print(f"\n  ⚠️  No fusion method satisfies FAR≤{MAX_FAR_CONSTRAINT*100:.1f}% "
+                      f"— showing lowest-FAR result instead.")
             print(f"\n  🏆 Best fusion (max DR, FAR≤{MAX_FAR_CONSTRAINT*100:.1f}%): "
                   f"{best_fus['model']}")
             print(f"     DR={best_fus['dr']:.2%}  FAR={best_fus['far']:.2%}  "
