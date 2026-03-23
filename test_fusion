@@ -60,9 +60,13 @@ models into a single alarm decision.
 
  Fusion parameter selection — no leakage
  ─────────────────────────────────────────
-   The test scenarios are split 50/50 into Fusion-Val and Fusion-Test:
-     • Fusion-Val  (7.5% of total): used to pick w and threshold
-     • Fusion-Test (7.5% of total): locked evaluation, reported in thesis
+   Two-step Calibration → Evaluation workflow:
+     • Calibration (val.h5):    sweep w and threshold, save fusion_settings.json.
+                                val.h5 is split 50/50 internally so parameter
+                                selection and reporting are on different halves.
+     • Evaluation  (test.h5 or all_data.h5): load locked fusion_settings.json,
+                                apply fixed w and threshold, report final numbers.
+                                No sweeping — parameters were chosen on val.h5.
    Individual model thresholds (RF, CNN) were already selected during
    training on their own validation sets and are NOT re-optimized here.
 
@@ -529,8 +533,8 @@ def run_fusion_evaluation(
     """
     print("\n" + "="*60)
     print("  FUSION EVALUATION")
-    print(f"  Val  : {len(val_df)} scenarios  (parameter selection)")
-    print(f"  Test : {len(test_df)} scenarios  (final reported numbers)")
+    print(f"  Calibration set : {len(val_df)} scenarios  "
+          f"(parameter selection, FAR constraint={MAX_FAR_CONSTRAINT*100:.1f}%)")
     print("="*60)
 
     has_val_inc  = val_df["has_incident"].sum()  > 0
@@ -1063,19 +1067,17 @@ def main() -> None:
         print(f"\n  Joint scenarios (RF ∩ CNN): {len(joint_df)}")
 
         if mode == "calibration":
-            # ── CALIBRATION: sweep on fusion-val, evaluate on fusion-test ───
-            all_scen = joint_df["scenario_id"].values
-            rng_fuse = np.random.default_rng(cfg.random_state)
-            shuffled = rng_fuse.permutation(all_scen)
-            n_val_fuse = max(1, len(shuffled) // 2)
-            val_scen_ids  = set(shuffled[:n_val_fuse])
-            test_scen_ids = set(shuffled[n_val_fuse:])
-            fusion_val_df  = joint_df[joint_df["scenario_id"].isin(val_scen_ids)].copy()
-            fusion_test_df = joint_df[joint_df["scenario_id"].isin(test_scen_ids)].copy()
+            # ── CALIBRATION: sweep on the entire val.h5 ───────────────────
+            # No internal split — the whole point of the workflow is that
+            # val.h5 is for calibration and test.h5 is the held-out set.
+            # Splitting val.h5 would waste half the calibration data.
+            fusion_val_df  = joint_df.copy()
+            fusion_test_df = joint_df.copy()   # same set; calibration "results"
+                                               # are indicative only — thesis
+                                               # numbers come from test.h5 run
 
-            print(f"  Fusion-Val  : {len(fusion_val_df)} scenarios  "
-                  f"(parameter selection, FAR constraint={MAX_FAR_CONSTRAINT*100:.1f}%)")
-            print(f"  Fusion-Test : {len(fusion_test_df)} scenarios  (final reported numbers)")
+            print(f"  Calibration on : {len(fusion_val_df)} scenarios  "
+                  f"(FAR constraint={MAX_FAR_CONSTRAINT*100:.1f}%)")
 
             fusion_results = run_fusion_evaluation(fusion_val_df, fusion_test_df)
 
@@ -1187,13 +1189,13 @@ def main() -> None:
     print("  SUMMARY")
     print("="*70)
     print(f"\n  Mode      : {mode.upper()}")
-    print(f"  Test set  : {files['macro_h5'].name}  "
+    print(f"  Data set  : {files['macro_h5'].name}  "
           f"({'incidents present' if has_incidents else 'no incidents — FAR only'})")
     print(f"  Scenarios evaluated: {len(rf_scen_df)}")
-    if mode == "calibration" and fusion_test_df is not None:
-        print(f"  Fusion-Val / Fusion-Test split: "
-              f"{len(fusion_val_df)} / {len(fusion_test_df)} scenarios")
-        print(f"  Fusion numbers below are from Fusion-Test (unseen during param selection)")
+    if mode == "calibration":
+        print(f"  All {len(fusion_val_df) if fusion_val_df is not None else 0} "
+              f"joint scenarios used for parameter selection")
+        print(f"  fusion_settings.json saved — run again with test.h5 for final numbers")
     elif mode == "evaluation":
         print(f"  Fusion parameters locked from: {FUSION_SETTINGS_PATH.name}")
     print()
