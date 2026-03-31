@@ -68,13 +68,22 @@ class FeatureEngineer:
         return result
     
     def create_temporal_derivatives(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Create temporal derivative features (rate of change)"""
+        """Create temporal derivative features (rate of change) and lag features."""
         result = df.copy()
         
         for det_edge in config.detector_edges:
             result[f'{det_edge}_speed_rate'] = df[f'{det_edge}_speed_mean'].diff()
             result[f'{det_edge}_flow_rate'] = df[f'{det_edge}_flow'].diff()
             result[f'{det_edge}_occupancy_rate'] = df[f'{det_edge}_occupancy'].diff()
+            # Lag features — must match what was used during RF training.
+            # The saved feature_columns.json contains _lag1 and _lag2 columns;
+            # without these the model fills them with 0, degrading performance.
+            result[f'{det_edge}_speed_mean_lag1'] = df[f'{det_edge}_speed_mean'].shift(1)
+            result[f'{det_edge}_speed_mean_lag2'] = df[f'{det_edge}_speed_mean'].shift(2)
+            result[f'{det_edge}_occupancy_lag1']  = df[f'{det_edge}_occupancy'].shift(1)
+            result[f'{det_edge}_occupancy_lag2']  = df[f'{det_edge}_occupancy'].shift(2)
+            result[f'{det_edge}_flow_lag1']       = df[f'{det_edge}_flow'].shift(1)
+            result[f'{det_edge}_flow_lag2']       = df[f'{det_edge}_flow'].shift(2)
         
         return result
     
