@@ -100,7 +100,7 @@ from sklearn.metrics import (
 )
 
 # ── Project paths ─────────────────────────────────────────────────────────────
-_PROJECT = Path(r"C:\Users\36302\Desktop\Thesis\I")
+_PROJECT = Path(r"C:\Users\36302\Desktop\Thesis\II")
 sys.path.insert(0, str(_PROJECT))
 
 import config as cfg  # noqa: E402
@@ -599,8 +599,8 @@ class AIDCNNModel:
         loader:    DataLoader,
         optimizer: Optional[torch.optim.Optimizer],
         training:  bool,
-    ) -> Tuple[float, float]:
-        """Run one epoch. Returns (avg_loss, f1_score)."""
+    ) -> Tuple[float, float, float, float]:
+        """Run one epoch. Returns (avg_loss, f1, precision, recall)."""
         self.model.train(training)
         criterion = nn.BCEWithLogitsLoss(pos_weight=self._pos_weight)
         total_loss, all_preds, all_labels = 0.0, [], []
@@ -628,7 +628,9 @@ class AIDCNNModel:
 
         avg_loss = total_loss / max(len(loader.dataset), 1)
         ep_f1    = f1_score(all_labels, all_preds, zero_division=0)
-        return avg_loss, ep_f1
+        ep_prec  = precision_score(all_labels, all_preds, zero_division=0)
+        ep_rec   = recall_score(all_labels, all_preds, zero_division=0)
+        return avg_loss, ep_f1, ep_prec, ep_rec
 
     def train(
         self,
@@ -660,10 +662,14 @@ class AIDCNNModel:
 
         t0 = time.time()
         for epoch in range(1, self.phase1_epochs + 1):
-            tr_loss, tr_f1 = self._run_epoch(train_loader, opt1, training=True)
-            vl_loss, vl_f1 = self._run_epoch(val_loader,   None,  training=False)
+            ep_t0 = time.time()
+            tr_loss, tr_f1, tr_prec, tr_rec = self._run_epoch(train_loader, opt1, training=True)
+            vl_loss, vl_f1, vl_prec, vl_rec = self._run_epoch(val_loader,   None,  training=False)
+            ep_secs = time.time() - ep_t0
             sched1.step(vl_loss)
-            self._log_epoch("P1", epoch, tr_loss, tr_f1, vl_loss, vl_f1)
+            cur_lr = opt1.param_groups[0]['lr']
+            self._log_epoch("P1", epoch, tr_loss, tr_f1, tr_prec, tr_rec,
+                            vl_loss, vl_f1, vl_prec, vl_rec, cur_lr, ep_secs)
 
             if vl_loss < self.best_val_loss:
                 self.best_val_loss = vl_loss
@@ -691,10 +697,14 @@ class AIDCNNModel:
             no_improve = 0
 
             for epoch in range(1, remaining_epochs + 1):
-                tr_loss, tr_f1 = self._run_epoch(train_loader, opt2, training=True)
-                vl_loss, vl_f1 = self._run_epoch(val_loader,   None,  training=False)
+                ep_t0 = time.time()
+                tr_loss, tr_f1, tr_prec, tr_rec = self._run_epoch(train_loader, opt2, training=True)
+                vl_loss, vl_f1, vl_prec, vl_rec = self._run_epoch(val_loader,   None,  training=False)
+                ep_secs = time.time() - ep_t0
                 sched2.step(vl_loss)
-                self._log_epoch("P2", epoch, tr_loss, tr_f1, vl_loss, vl_f1)
+                cur_lr = opt2.param_groups[0]['lr']
+                self._log_epoch("P2", epoch, tr_loss, tr_f1, tr_prec, tr_rec,
+                                vl_loss, vl_f1, vl_prec, vl_rec, cur_lr, ep_secs)
 
                 if vl_loss < self.best_val_loss:
                     self.best_val_loss = vl_loss
@@ -718,20 +728,28 @@ class AIDCNNModel:
 
     def _log_epoch(
         self, phase: str, epoch: int,
-        tr_loss: float, tr_f1: float,
-        vl_loss: float, vl_f1: float,
+        tr_loss: float, tr_f1: float, tr_prec: float, tr_rec: float,
+        vl_loss: float, vl_f1: float, vl_prec: float, vl_rec: float,
+        lr: float, ep_secs: float,
     ) -> None:
         self.history["phase"].append(phase)
         self.history["epoch"].append(epoch)
         self.history["train_loss"].append(tr_loss)
         self.history["train_f1"].append(tr_f1)
+        self.history["train_prec"].append(tr_prec)
+        self.history["train_rec"].append(tr_rec)
         self.history["val_loss"].append(vl_loss)
         self.history["val_f1"].append(vl_f1)
+        self.history["val_prec"].append(vl_prec)
+        self.history["val_rec"].append(vl_rec)
+        self.history["lr"].append(lr)
+        self.history["ep_secs"].append(ep_secs)
         star = " ★" if vl_loss <= self.best_val_loss else ""
         print(
             f"  [{phase}] Epoch {epoch:3d}  "
-            f"train_loss={tr_loss:.4f} f1={tr_f1:.3f}  |  "
-            f"val_loss={vl_loss:.4f} f1={vl_f1:.3f}{star}"
+            f"train loss={tr_loss:.4f} f1={tr_f1:.3f} p={tr_prec:.3f} r={tr_rec:.3f}  |  "
+            f"val loss={vl_loss:.4f} f1={vl_f1:.3f} p={vl_prec:.3f} r={vl_rec:.3f}  "
+            f"lr={lr:.2e}  {ep_secs/60:.1f}min{star}"
         )
 
     # ── Threshold selection (mirrors model.py) ────────────────────────────
@@ -904,24 +922,74 @@ class AIDCNNModel:
     # ── Plotting ──────────────────────────────────────────────────────────
 
     def _plot_training_history(self) -> None:
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
         epochs = list(range(1, len(self.history["train_loss"]) + 1))
-        ax1.plot(epochs, self.history["train_loss"], label="Train")
-        ax1.plot(epochs, self.history["val_loss"],   label="Val")
-        ax1.set_title("Loss")
-        ax1.set_xlabel("Epoch")
-        ax1.legend()
-        ax1.grid(alpha=0.3)
-        ax2.plot(epochs, self.history["train_f1"], label="Train")
-        ax2.plot(epochs, self.history["val_f1"],   label="Val")
-        ax2.set_title("F1-score")
-        ax2.set_xlabel("Epoch")
-        ax2.legend()
-        ax2.grid(alpha=0.3)
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+        (ax_loss, ax_f1), (ax_pr, ax_lr) = axes
+
+        # ── Loss ─────────────────────────────────────────────────────────────
+        ax_loss.plot(epochs, self.history["train_loss"], label="Train", color="steelblue")
+        ax_loss.plot(epochs, self.history["val_loss"],   label="Val",   color="tomato")
+        ax_loss.set_title("Loss (val_loss drives early stopping & best model)")
+        ax_loss.set_xlabel("Epoch")
+        ax_loss.set_ylabel("BCE Loss")
+        ax_loss.legend()
+        ax_loss.grid(alpha=0.3)
+
+        # ── F1 ───────────────────────────────────────────────────────────────
+        ax_f1.plot(epochs, self.history["train_f1"], label="Train F1",  color="steelblue")
+        ax_f1.plot(epochs, self.history["val_f1"],   label="Val F1",    color="tomato")
+        ax_f1.set_title("F1-score  (threshold=0.5 during training)")
+        ax_f1.set_xlabel("Epoch")
+        ax_f1.set_ylabel("F1")
+        ax_f1.set_ylim(0, 1)
+        ax_f1.legend()
+        ax_f1.grid(alpha=0.3)
+
+        # ── Precision & Recall ────────────────────────────────────────────────
+        if self.history.get("val_prec"):
+            ax_pr.plot(epochs, self.history["train_prec"], label="Train Prec",
+                       color="steelblue", linestyle="--")
+            ax_pr.plot(epochs, self.history["train_rec"],  label="Train Rec",
+                       color="steelblue")
+            ax_pr.plot(epochs, self.history["val_prec"],   label="Val Prec",
+                       color="tomato",    linestyle="--")
+            ax_pr.plot(epochs, self.history["val_rec"],    label="Val Rec",
+                       color="tomato")
+            ax_pr.set_title("Precision (--) & Recall (─)  — low recall = misses incidents")
+            ax_pr.set_xlabel("Epoch")
+            ax_pr.set_ylim(0, 1)
+            ax_pr.legend(fontsize=8)
+            ax_pr.grid(alpha=0.3)
+
+        # ── Learning rate + epoch time ────────────────────────────────────────
+        if self.history.get("lr"):
+            color_lr   = "purple"
+            color_time = "darkorange"
+            ax_lr.plot(epochs, self.history["lr"], color=color_lr,
+                       label="LR", linewidth=1.5)
+            ax_lr.set_xlabel("Epoch")
+            ax_lr.set_ylabel("Learning rate", color=color_lr)
+            ax_lr.tick_params(axis="y", labelcolor=color_lr)
+            ax_lr.set_yscale("log")
+            ax_lr2 = ax_lr.twinx()
+            if self.history.get("ep_secs"):
+                ax_lr2.plot(epochs,
+                            [s / 60 for s in self.history["ep_secs"]],
+                            color=color_time, linestyle=":", linewidth=1.5,
+                            label="Epoch time (min)")
+                ax_lr2.set_ylabel("Epoch time (min)", color=color_time)
+                ax_lr2.tick_params(axis="y", labelcolor=color_time)
+            ax_lr.set_title("Learning rate & epoch time  (rising time = throttling/leak?)")
+            lines1, labs1 = ax_lr.get_legend_handles_labels()
+            lines2, labs2 = ax_lr2.get_legend_handles_labels()
+            ax_lr.legend(lines1 + lines2, labs1 + labs2, fontsize=8)
+            ax_lr.grid(alpha=0.3)
+
         plt.tight_layout()
         plt.savefig(CNN_RESULTS / "training_history.png", dpi=150)
         plt.close()
-        print(f"  💾 Training history saved.")
+        print(f"  💾 Training history saved (loss, F1, precision/recall, LR/time).")
 
     def _plot_confusion_matrix(self, cm: np.ndarray, split_name: str) -> None:
         import seaborn as sns
