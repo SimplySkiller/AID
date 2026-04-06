@@ -72,18 +72,16 @@ class FeatureEngineer:
         result = df.copy()
         
         for det_edge in config.detector_edges:
-            result[f'{det_edge}_speed_rate'] = df[f'{det_edge}_speed_mean'].diff()
-            result[f'{det_edge}_flow_rate'] = df[f'{det_edge}_flow'].diff()
-            result[f'{det_edge}_occupancy_rate'] = df[f'{det_edge}_occupancy'].diff()
-            # Lag features — must match what was used during RF training.
-            # The saved feature_columns.json contains _lag1 and _lag2 columns;
-            # without these the model fills them with 0, degrading performance.
-            result[f'{det_edge}_speed_mean_lag1'] = df[f'{det_edge}_speed_mean'].shift(1)
-            result[f'{det_edge}_speed_mean_lag2'] = df[f'{det_edge}_speed_mean'].shift(2)
-            result[f'{det_edge}_occupancy_lag1']  = df[f'{det_edge}_occupancy'].shift(1)
-            result[f'{det_edge}_occupancy_lag2']  = df[f'{det_edge}_occupancy'].shift(2)
-            result[f'{det_edge}_flow_lag1']       = df[f'{det_edge}_flow'].shift(1)
-            result[f'{det_edge}_flow_lag2']       = df[f'{det_edge}_flow'].shift(2)
+            result[f'{det_edge}_speed_rate']      = df[f'{det_edge}_speed_mean'].diff()
+            result[f'{det_edge}_flow_rate']        = df[f'{det_edge}_flow'].diff()
+            result[f'{det_edge}_occupancy_rate']   = df[f'{det_edge}_occupancy'].diff()
+            # Lag features — required so feature_columns.json matches at inference time.
+            result[f'{det_edge}_speed_mean_lag1']  = df[f'{det_edge}_speed_mean'].shift(1)
+            result[f'{det_edge}_speed_mean_lag2']  = df[f'{det_edge}_speed_mean'].shift(2)
+            result[f'{det_edge}_occupancy_lag1']   = df[f'{det_edge}_occupancy'].shift(1)
+            result[f'{det_edge}_occupancy_lag2']   = df[f'{det_edge}_occupancy'].shift(2)
+            result[f'{det_edge}_flow_lag1']        = df[f'{det_edge}_flow'].shift(1)
+            result[f'{det_edge}_flow_lag2']        = df[f'{det_edge}_flow'].shift(2)
         
         return result
     
@@ -459,10 +457,21 @@ class AIDModel:
         print("="*60)
         
         # USE A REPRESENTATIVE SUBSET FOR DIAGNOSTICS (to prevent freezing)
+        # Stratify by has_incident so every train-size slice contains both classes.
+        # Without this, the smallest slices may be NI-only and learning_curve
+        # raises "pos_label=1 is not a valid label" for every CV fold.
         print("📉 Preparing diagnostic subset...")
-        diag_scenarios = train_df['scenario_id'].unique()[:int(len(train_df['scenario_id'].unique())*0.15)]
-        diag_df = train_df[train_df['scenario_id'].isin(diag_scenarios)]
-        
+        inc_scens = train_df[train_df['has_incident'] == 1]['scenario_id'].unique()
+        ni_scens  = train_df[train_df['has_incident'] == 0]['scenario_id'].unique()
+        n_diag    = max(10, int(len(train_df['scenario_id'].unique()) * 0.15))
+        n_inc     = max(4, n_diag // 2)
+        n_ni      = max(4, n_diag - n_inc)
+        rng_diag  = np.random.default_rng(config.random_state)
+        chosen_inc = rng_diag.choice(inc_scens, size=min(n_inc, len(inc_scens)), replace=False)
+        chosen_ni  = rng_diag.choice(ni_scens,  size=min(n_ni,  len(ni_scens)),  replace=False)
+        diag_ids  = np.concatenate([chosen_inc, chosen_ni])
+        diag_df   = train_df[train_df['scenario_id'].isin(diag_ids)]
+
         X_diag_df, y_diag_df = self.prepare_data(diag_df, engineer_features=True)
         X_diag = X_diag_df.to_numpy(dtype=np.float32, copy=False)
         y_diag = y_diag_df.to_numpy(copy=False)
@@ -918,26 +927,56 @@ class AIDModel:
 
     def plot_far_vs_threshold(self, y_true, y_proba):
         """
-        Plot False Alarm Rate vs decision threshold
+        Plot False Alarm Rate vs decision threshold — full view + zoomed inset.
         """
         fpr, tpr, thresholds = roc_curve(y_true, y_proba)
 
-        plt.figure(figsize=(8, 6))
-        plt.plot(thresholds, fpr, label="False Alarm Rate")
-        plt.axvline(self.decision_threshold, color='red', linestyle='--',
-            label=f"Selected threshold = {self.decision_threshold:.2f}")
-        plt.xlabel("Decision Threshold")
-        plt.ylabel("False Alarm Rate")
-        plt.title("False Alarm Rate vs Threshold")
-        plt.legend()
-        plt.grid(alpha=0.3)
-        plt.tight_layout()
+        def _save_far_plot(ax_or_fig, thresholds, fpr, thr_line,
+                           xlim=None, ylim=None, title_suffix="", path=None):
+            fig, ax = plt.subplots(figsize=(8, 6))
+            ax.plot(thresholds, fpr, color='steelblue', linewidth=2,
+                    label="False Alarm Rate")
+            ax.axvline(thr_line, color='red', linestyle='--', linewidth=1.5,
+                       label=f"Selected threshold = {thr_line:.4f}")
+            ax.axhline(0.0, color='gray', linestyle=':', linewidth=1, alpha=0.5)
+            if xlim:
+                ax.set_xlim(xlim)
+            if ylim:
+                ax.set_ylim(ylim)
+            ax.set_xlabel("Decision Threshold")
+            ax.set_ylabel("False Alarm Rate")
+            ax.set_title(f"False Alarm Rate vs Threshold{title_suffix}")
+            ax.legend()
+            ax.grid(alpha=0.3)
+            plt.tight_layout()
+            plt.savefig(path, dpi=300)
+            plt.close()
+            print(f"💾 FAR vs threshold plot saved to {path}")
 
-        save_path = config.results_dir / "far_vs_threshold.png"
-        plt.savefig(save_path, dpi=300)
-        plt.close()
+        save_dir = config.results_dir
 
-        print(f"💾 FAR vs threshold plot saved to {save_path}")
+        # ── Full view ────────────────────────────────────────────────────────
+        _save_far_plot(None, thresholds, fpr, self.decision_threshold,
+                       path=save_dir / "far_vs_threshold.png")
+
+        # ── Zoomed view: focus on the region where FAR actually reaches 0 ───
+        # Find threshold where FAR first hits 0.0 (or the minimum achieved).
+        min_far    = fpr.min()
+        zero_mask  = fpr <= min_far + 1e-6
+        zero_thr   = thresholds[zero_mask].min() if zero_mask.any() else self.decision_threshold
+
+        # Show the last 10 pp of threshold before zero-FAR point,
+        # y-axis zoomed to [0, 5× the FAR at the selected threshold] so the
+        # descent to 0 is clearly visible.
+        x_lo = max(0.0, float(zero_thr) - 0.10)
+        x_hi = min(1.0, float(zero_thr) + 0.05)
+        far_at_thr = float(fpr[np.argmin(np.abs(thresholds - self.decision_threshold))])
+        y_hi = max(0.02, far_at_thr * 5)
+
+        _save_far_plot(None, thresholds, fpr, self.decision_threshold,
+                       xlim=(x_lo, x_hi), ylim=(0.0, y_hi),
+                       title_suffix=" — zoomed (near zero-FAR region)",
+                       path=save_dir / "far_vs_threshold_zoomed.png")
     
     def save_model(self):
         """Save trained model and metadata"""
