@@ -141,18 +141,29 @@ class SUMOSimulator:
         if flow_total > 0:
             mainline_time   = 0.0
             mainline_veh_id = 0
+
+            # Speed factor interpretation (dampened anchor approach):
+            # SF=1.0 anchored at speed limit. Deviations dampened by 0.5.
+            # Slow lane base=0.85 (110 km/h), Fast lane base=1.00 (130 km/h).
+            SLOW_LANE_BASE = 0.85
+            FAST_LANE_BASE = 1.00
+            SF_SENSITIVITY = 0.50
+            sf_factor = 1.0 + (speed_factor_mean - 1.0) * SF_SENSITIVITY
+
             while mainline_time < max_time:
-                # Lane 0 = right, lane 1 = left — direct (no remapping for Map 2)
-                target_lane = 0 if random.random() < config.lane0_preference else 1
-                speed_factor = np.random.normal(
-                    config.speed_factor_lane0_mean if target_lane == 0
-                    else config.speed_factor_lane1_mean,
-                    config.speed_factor_lane0_std if target_lane == 0
-                    else config.speed_factor_lane1_std,
-                )
-                speed_factor = float(np.clip(speed_factor,
-                                             config.speed_factor_clip_min,
-                                             config.speed_factor_clip_max))
+                # Lane 0 = right / slow, lane 1 = left / fast (Map 2 direct indices)
+                is_slow_lane = random.random() < config.lane0_preference
+                target_lane  = 0 if is_slow_lane else 1
+
+                lane_mean = (SLOW_LANE_BASE if is_slow_lane else FAST_LANE_BASE) * sf_factor
+                lane_std  = (config.speed_factor_lane0_std if is_slow_lane
+                             else config.speed_factor_lane1_std)
+
+                speed_factor = float(np.clip(
+                    np.random.normal(lane_mean, lane_std),
+                    config.speed_factor_clip_min,
+                    config.speed_factor_clip_max,
+                ))
                 all_vehicles.append({
                     'depart':      mainline_time,
                     'id':          f"mainline_{mainline_veh_id}",
