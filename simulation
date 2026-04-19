@@ -142,12 +142,17 @@ class SUMOSimulator:
             mainline_time   = 0.0
             mainline_veh_id = 0
 
-            # Speed factor interpretation (dampened anchor approach):
-            # SF=1.0 anchored at speed limit. Deviations dampened by 0.5.
-            # Slow lane base=0.85 (110 km/h), Fast lane base=1.00 (130 km/h).
-            SLOW_LANE_BASE = 0.85
+            # Option G — dampened anchor approach (friend's formula, tuned):
+            # SF=1.0 anchored at speed limit. Deviations dampened by 0.30.
+            # slow_base=0.82 → 107 km/h at SF=1.0
+            # fast_base=1.00 → 130 km/h at SF=1.0 (exactly the speed limit)
+            # Resulting means:
+            #   SF=0.7 → slow=97, fast=118 km/h
+            #   SF=1.0 → slow=107, fast=130 km/h
+            #   SF=1.3 → slow=116, fast=142 km/h
+            SLOW_LANE_BASE = 0.82
             FAST_LANE_BASE = 1.00
-            SF_SENSITIVITY = 0.50
+            SF_SENSITIVITY = 0.30
             sf_factor = 1.0 + (speed_factor_mean - 1.0) * SF_SENSITIVITY
 
             while mainline_time < max_time:
