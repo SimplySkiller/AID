@@ -244,7 +244,15 @@ class SUMOSimulator:
         if not self.gui_mode:
             sumo_cmd.append("--start")
         
-        # Give each scenario a truly unique port
+        # Kill any zombie sumo.exe from previous force-quits BEFORE starting a new one.
+        # If a previous terminal session was force-closed, sumo.exe may still be running
+        # holding the port. traci.start() then blocks forever waiting for a connection.
+        import subprocess as _sp
+        _sp.run(["taskkill", "/f", "/im", "sumo.exe"],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        _sp.run(["taskkill", "/f", "/im", "sumo-gui.exe"],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+
         base_port   = 8813 + (scenario_id % 5000)
         last_error  = None
         for attempt in range(3):
