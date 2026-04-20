@@ -256,6 +256,12 @@ class SUMOSimulator:
         if not self.gui_mode:
             sumo_cmd.append("--start")
 
+        import subprocess as _sp
+        _sp.run(["taskkill", "/f", "/im", "sumo.exe"],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+        _sp.run(["taskkill", "/f", "/im", "sumo-gui.exe"],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+
         base_port  = 8813 + (scenario_id % 5000)
         last_error = None
         for attempt in range(3):
