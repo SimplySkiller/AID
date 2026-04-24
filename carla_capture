@@ -1428,7 +1428,21 @@ class AIDScenarioRunner:
 
 
 
-MACRO_H5 = cfg.data_dir / "all_data.h5"   # matches simulation.py output filename
+def _normalise_macro_dtypes(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Cast all numeric columns to float64 before writing to HDF5.
+    Prevents schema mismatch errors when appending batches where some columns
+    (e.g. incident_position) are int in NI scenarios and float in incident scenarios.
+    """
+    for col in df.columns:
+        if col == "scenario_id":
+            df[col] = df[col].astype(str)
+        else:
+            try:
+                df[col] = df[col].astype(float)
+            except (ValueError, TypeError):
+                df[col] = df[col].astype(str)
+    return df   # matches simulation.py output filename
 
 
 # Columns always written to HDF5 in this exact order (must be stable across all scenarios)
@@ -1464,7 +1478,32 @@ def _append_macro_hdf5(df: pd.DataFrame) -> None:
 MASTER_CSV = DATASET_DIR / "master_metadata.csv"
 
 
-def _write_csv(path: Path, rows: List[dict]) -> None:
+def _normalize_macro_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensure consistent dtypes before writing to HDF5 with append=True.
+    Mixed int/float in the same column across batches causes a schema
+    mismatch error (e.g. incident_position=0 in NI rows vs 2471.0 in
+    incident rows). Converting everything numeric to float64 prevents this.
+    """
+    df = df.copy()
+    df = df.drop(columns=["step"], errors="ignore")
+    for col in df.select_dtypes(include=["integer", "int32", "int64"]).columns:
+        df[col] = df[col].astype("float64")
+    return df
+
+
+def _append_macro_hdf(df: pd.DataFrame, path: Path) -> None:
+    """Append a normalized macro DataFrame to the HDF5 file."""
+    df = _normalize_macro_df(df)
+    if path.exists() and path.stat().st_size > 1000:
+        df.to_hdf(path, key="data", mode="a", format="table",
+                  append=True,
+                  data_columns=["scenario_id", "sim_time",
+                                "incident_active", "has_incident"])
+    else:
+        df.to_hdf(path, key="data", mode="w", format="table",
+                  data_columns=["scenario_id", "sim_time",
+                                "incident_active", "has_incident"])
     all_fields: list = []
     seen = set()
     for r in rows:
@@ -1703,20 +1742,7 @@ def main() -> None:
             # ── Macro data checkpoint ─────────────────────────────────────────
             if i % MACRO_CHECKPOINT_EVERY == 0 and runner.all_macro_rows:
                 chk_df = pd.DataFrame(runner.all_macro_rows)
-                chk_df = chk_df.drop(columns=["step"], errors="ignore")
-                if MACRO_H5.exists() and MACRO_H5.stat().st_size > 1000:
-                    # append=True is required to add rows to existing table.
-                    # mode="a" alone only opens without truncating but still
-                    # replaces the key — append=True actually concatenates rows.
-                    chk_df.to_hdf(MACRO_H5, key="data", mode="a", format="table",
-                                  append=True,
-                                  data_columns=["scenario_id", "sim_time",
-                                                "incident_active", "has_incident"])
-                else:
-                    # First checkpoint: create the file fresh.
-                    chk_df.to_hdf(MACRO_H5, key="data", mode="w", format="table",
-                                  data_columns=["scenario_id", "sim_time",
-                                                "incident_active", "has_incident"])
+                _append_macro_hdf(chk_df, MACRO_H5)
                 runner.all_macro_rows = []
                 print(f"[CKPT] Macro checkpoint at scenario {i}: "
                       f"{len(chk_df):,} rows appended to {MACRO_H5.name}")
@@ -1752,16 +1778,7 @@ def main() -> None:
     # complete dataset back from disk for splitting.
     if runner.all_macro_rows:
         remaining_df = pd.DataFrame(runner.all_macro_rows)
-        remaining_df = remaining_df.drop(columns=["step"], errors="ignore")
-        if MACRO_H5.exists() and MACRO_H5.stat().st_size > 1000:
-            remaining_df.to_hdf(MACRO_H5, key="data", mode="a", format="table",
-                                append=True,
-                                data_columns=["scenario_id", "sim_time",
-                                              "incident_active", "has_incident"])
-        else:
-            remaining_df.to_hdf(MACRO_H5, key="data", mode="w", format="table",
-                                data_columns=["scenario_id", "sim_time",
-                                              "incident_active", "has_incident"])
+        _append_macro_hdf(remaining_df, MACRO_H5)
         print(f"[MAIN] Final macro flush: {len(remaining_df):,} rows appended.")
         runner.all_macro_rows = []
 
