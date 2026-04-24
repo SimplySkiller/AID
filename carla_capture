@@ -699,12 +699,13 @@ class AIDScenarioRunner:
         Scenario ends at incident_clear_time (clean label boundary).
     """
 
-    def __init__(self, dry_run: bool = False) -> None:
+    def __init__(self, dry_run: bool = False, macro_only: bool = False) -> None:
         self.dry_run       = dry_run
+        self.macro_only    = macro_only   # run SUMO always, skip CARLA, ignore existing images
         self.sumo          = SUMOSimulator(gui_mode=False)
-        self.all_macro_rows: list = []   # accumulates all scenarios, saved once at end
-        self.discarded_scenarios: list = []   # (scen_label, reason) for summary report
-        self.warn_scenarios: list = []         # (scen_label, reason) non-fatal warnings
+        self.all_macro_rows: list = []
+        self.discarded_scenarios: list = []
+        self.warn_scenarios: list = []
 
     def run(
         self,
@@ -930,13 +931,15 @@ class AIDScenarioRunner:
                         pass
 
         # Skip already-completed scenarios so re-runs are safe.
-        if scen_csv.exists():
+        if scen_csv.exists() and not self.macro_only:
             import csv as _csv
             with open(scen_csv, newline="", encoding="utf-8") as fh:
                 existing_count = sum(1 for _ in _csv.DictReader(fh))
             if existing_count > 0:
                 print(f"[SKIP] {scen_label} already has {existing_count} frames - skipping.")
                 return []
+        elif scen_csv.exists() and self.macro_only:
+            print(f"[MACRO-ONLY] {scen_label}: images exist, running SUMO only for macro data.")
 
         print(f"\n{'─'*60}")
         print(f"[{scen_label}] flow={flow_total} veh/h  sf={speed_factor_mean:.2f}  "
@@ -1604,6 +1607,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--macro-only", action="store_true",
+        help=(
+            "Run SUMO for macro data collection only, skip CARLA entirely. "
+            "Unlike --dry-run, this processes ALL scenarios including those "
+            "whose images already exist on disk. Use to recover macro data "
+            "after a crash without regenerating images: "
+            "py -3.8 carla_capture.py --macro-only --limit 434"
+        ),
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Run SUMO only, skip CARLA. Fast way to validate incident injection.",
     )
@@ -1672,8 +1685,8 @@ def main() -> None:
 
     # CARLA always runs unless --dry-run is explicitly set.
     # --no-incident-only only filters the scenario list, it does NOT skip CARLA.
-    effective_dry_run = args.dry_run
-    runner = AIDScenarioRunner(dry_run=effective_dry_run)
+    effective_dry_run = args.dry_run or args.macro_only
+    runner = AIDScenarioRunner(dry_run=effective_dry_run, macro_only=args.macro_only)
 
     MACRO_CHECKPOINT_EVERY = 50   # write macro data to disk every N scenarios
 
@@ -1688,17 +1701,23 @@ def main() -> None:
             _append_master_csv(rows)
 
             # ── Macro data checkpoint ─────────────────────────────────────────
-            # Write accumulated macro rows to disk every N scenarios so that a
-            # hang or crash never loses more than N scenarios of RF training data.
-            # Uses append mode so existing data is preserved.
             if i % MACRO_CHECKPOINT_EVERY == 0 and runner.all_macro_rows:
                 chk_df = pd.DataFrame(runner.all_macro_rows)
                 chk_df = chk_df.drop(columns=["step"], errors="ignore")
-                chk_mode = "a" if MACRO_H5.exists() and MACRO_H5.stat().st_size > 1000 else "w"
-                chk_df.to_hdf(MACRO_H5, key="data", mode=chk_mode, format="table",
-                              data_columns=["scenario_id", "sim_time",
-                                            "incident_active", "has_incident"])
-                runner.all_macro_rows = []   # clear after checkpoint to free memory
+                if MACRO_H5.exists() and MACRO_H5.stat().st_size > 1000:
+                    # append=True is required to add rows to existing table.
+                    # mode="a" alone only opens without truncating but still
+                    # replaces the key — append=True actually concatenates rows.
+                    chk_df.to_hdf(MACRO_H5, key="data", mode="a", format="table",
+                                  append=True,
+                                  data_columns=["scenario_id", "sim_time",
+                                                "incident_active", "has_incident"])
+                else:
+                    # First checkpoint: create the file fresh.
+                    chk_df.to_hdf(MACRO_H5, key="data", mode="w", format="table",
+                                  data_columns=["scenario_id", "sim_time",
+                                                "incident_active", "has_incident"])
+                runner.all_macro_rows = []
                 print(f"[CKPT] Macro checkpoint at scenario {i}: "
                       f"{len(chk_df):,} rows appended to {MACRO_H5.name}")
     except KeyboardInterrupt:
@@ -1727,31 +1746,50 @@ def main() -> None:
                 stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
         print("[MAIN] Cleanup done (SUMO closed, CarlaUE4 killed if script-launched).")
 
-    # ── Save all macro data at once ──────────────────────────────────────────
+    # ── Final macro data flush + train/val/test split ────────────────────────
+    # If checkpoints ran, all_macro_rows was cleared to free memory but the data
+    # was appended to MACRO_H5. Flush any remaining rows first, then read the
+    # complete dataset back from disk for splitting.
     if runner.all_macro_rows:
-        print(f"\n[MAIN] Saving macro data: {len(runner.all_macro_rows)} total rows ...")
-        combined_df = pd.DataFrame(runner.all_macro_rows)
-        combined_df = combined_df.drop(columns=["step"], errors="ignore")
-        combined_df.to_hdf(MACRO_H5, key="data", mode="w", format="table",
-                           data_columns=["scenario_id", "sim_time", "incident_active", "has_incident"])
-        print(f"[MAIN] Macro data saved to {MACRO_H5.name}  ({len(combined_df):,} rows).")
+        remaining_df = pd.DataFrame(runner.all_macro_rows)
+        remaining_df = remaining_df.drop(columns=["step"], errors="ignore")
+        if MACRO_H5.exists() and MACRO_H5.stat().st_size > 1000:
+            remaining_df.to_hdf(MACRO_H5, key="data", mode="a", format="table",
+                                append=True,
+                                data_columns=["scenario_id", "sim_time",
+                                              "incident_active", "has_incident"])
+        else:
+            remaining_df.to_hdf(MACRO_H5, key="data", mode="w", format="table",
+                                data_columns=["scenario_id", "sim_time",
+                                              "incident_active", "has_incident"])
+        print(f"[MAIN] Final macro flush: {len(remaining_df):,} rows appended.")
+        runner.all_macro_rows = []
+
+    if MACRO_H5.exists():
+        print(f"\n[MAIN] Reading complete macro dataset from {MACRO_H5.name} for splitting ...")
+        combined_df = pd.read_hdf(MACRO_H5, key="data")
+        print(f"[MAIN] Total rows: {len(combined_df):,}  |  "
+              f"scenarios: {combined_df['scenario_id'].nunique()}")
 
         scenario_ids = combined_df["scenario_id"].unique()
         import numpy as _np
         rng = _np.random.default_rng(cfg.random_state)
         rng.shuffle(scenario_ids)
-        n_train = int(len(scenario_ids) * cfg.train_ratio)
-        n_val   = int(len(scenario_ids) * cfg.val_ratio)
+        n_train   = int(len(scenario_ids) * cfg.train_ratio)
+        n_val     = int(len(scenario_ids) * cfg.val_ratio)
         train_ids = scenario_ids[:n_train]
-        val_ids   = scenario_ids[n_train:n_train+n_val]
-        test_ids  = scenario_ids[n_train+n_val:]
+        val_ids   = scenario_ids[n_train:n_train + n_val]
+        test_ids  = scenario_ids[n_train + n_val:]
         combined_df[combined_df["scenario_id"].isin(train_ids)].to_hdf(
             cfg.train_h5, key="data", mode="w", format="table")
         combined_df[combined_df["scenario_id"].isin(val_ids)].to_hdf(
             cfg.val_h5,   key="data", mode="w", format="table")
         combined_df[combined_df["scenario_id"].isin(test_ids)].to_hdf(
             cfg.test_h5,  key="data", mode="w", format="table")
-        print(f"[MAIN] Macro split: train={len(train_ids)} val={len(val_ids)} test={len(test_ids)} scenarios.")
+        print(f"[MAIN] Split complete: "
+              f"train={len(train_ids)}  val={len(val_ids)}  test={len(test_ids)} scenarios.")
+    else:
+        print("[MAIN] WARNING: all_data.h5 not found — no macro data to split.")
 
     # ── Integrity check ──────────────────────────────────────────────────────
     print("\n[CHECK] Running integrity checks...")
@@ -1837,7 +1875,52 @@ if __name__ == "__main__":
 #   py -3.8 carla_capture.py --no-incident-only --limit 8   # quick NI-only smoke test
 #   py -3.8 carla_capture.py --split-only           # just rebuild train/val/test CSVs
 #
-# Output locations:
-#   Macro HDF5 : data/all_data.h5  (also split to data/train.h5, val.h5, test.h5)
-#   Images     : dataset/sXXXXX/images/frame_XXXXXX.png
+# ── SPLITTING A RUN ACROSS MULTIPLE DAYS ─────────────────────────────────────
+#
+# RULE: The --limit value MUST be a multiple of 50.
+#   Macro data is checkpointed to disk every 50 scenarios. If you stop at a
+#   non-multiple (e.g. 843), the last partial batch (43 scenarios) is saved by
+#   the final flush, so it still works — but using a clean multiple keeps
+#   things predictable. Recommended splits for 1170 total: 550, 600, 700, 850.
+#
+# Example — splitting 1170 scenarios across two days:
+#
+#   Day 1:
+#     py -3.8 carla_capture.py --limit 850
+#     → Runs scenarios 0–849. Saves images + macro data.
+#     → Produces data/train.h5, val.h5, test.h5 based on 850 scenarios only.
+#     → IGNORE these split files — they are incomplete.
+#     → DO NOT delete data/all_data.h5 or dataset/ between days.
+#
+#   Day 2 (next morning, restart CARLA/Unreal first):
+#     py -3.8 carla_capture.py --start-from 850
+#     → Runs scenarios 850–1169. Images for 0–849 are skipped automatically.
+#     → Appends macro data to all_data.h5.
+#     → At the end, reads the FULL 1170-scenario all_data.h5 and writes the
+#       CORRECT train.h5, val.h5, test.h5. Use only these split files.
+#
+# What to keep between days:
+#   ✅ data/all_data.h5          — contains macro data so far, DO NOT delete
+#   ✅ dataset/sXXXXX/ folders   — images on disk, DO NOT delete
+#   ✅ dataset/master_metadata.csv — image index, DO NOT delete
+#   ❌ data/train.h5, val.h5, test.h5  — ignore Day 1 versions, Day 2 overwrites
+#
+# ── CRASH / HANG RECOVERY ────────────────────────────────────────────────────
+#
+# If the script stops unexpectedly at scenario N:
+#   1. Check data/all_data.h5 file size. It should be large (>100MB for
+#      hundreds of scenarios). If it is tiny (<5MB), the macro data was lost.
+#
+#   Case A — all_data.h5 looks correct (large):
+#     Just resume: py -3.8 carla_capture.py --start-from N
+#
+#   Case B — all_data.h5 is tiny (macro data lost):
+#     Step 1: Delete data/all_data.h5 (DO NOT delete dataset/ images).
+#     Step 2: Recover macro for already-imaged scenarios (SUMO only, ~20 min):
+#               py -3.8 carla_capture.py --macro-only --limit N
+#     Step 3: Resume normally from N:
+#               py -3.8 carla_capture.py --start-from N
+#     Step 4: Only the split files from Step 3 are valid.
+#
+# ── OUTPUT LOCATIONS ─────────────────────────────────────────────────────────
 #   Metadata   : dataset/master_metadata.csv  (and train/val/test_metadata.csv)
