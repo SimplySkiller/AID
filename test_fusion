@@ -104,7 +104,7 @@ from sklearn.metrics import (
 from tqdm import tqdm
 
 # ── Project paths ─────────────────────────────────────────────────────────────
-_PROJECT = Path(r"C:\Users\36302\Desktop\Thesis\I")
+_PROJECT = Path(r"C:\Users\36302\Desktop\Thesis\II")
 sys.path.insert(0, str(_PROJECT))
 
 import config as cfg
@@ -143,6 +143,15 @@ MAX_FAR_CONSTRAINT = 0.001   # 0.1% false alarm rate ceiling
 
 # Persistent settings file written during calibration, read during evaluation.
 FUSION_SETTINGS_PATH = INPUT_FOLDER / "fusion_settings.json"
+
+# California Algorithm: same calibration → evaluation discipline as ML fusion.
+CAL_SETTINGS_PATH = INPUT_FOLDER / "california_settings.json"
+
+# Parameter grid — shared by calibration, locked evaluation, and post-hoc sweep.
+# Speed in m/s (130 km/h speed limit = 36.11 m/s).
+CAL_SPEED_THRS  = [5.0, 10.0, 15.0, 20.0, 25.0, 30.0]
+CAL_OCC_THRS    = [0.02, 0.05, 0.10, 0.15, 0.20, 0.30]
+CAL_PERSIST_SEC = [3, 5, 10, 15, 30]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1011,6 +1020,1072 @@ def run_fusion_evaluation_locked(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# POST-HOC ANALYSIS A: Threshold Sensitivity Sweep
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+#  ⚠️  DATA-LEAKAGE DISCLAIMER
+#  This analysis sweeps the avg_prob threshold AFTER seeing the test results.
+#  It is intentionally post-hoc and exploratory. The locked threshold saved in
+#  fusion_settings.json (calibrated on val.h5 only) is the primary thesis
+#  result.  This sweep is included ONLY to illustrate the DR/FAR trade-off
+#  curve and to identify the "zero-FAR operating point" for discussion.
+#  Label any resulting figure in the thesis:
+#    "Post-hoc threshold sensitivity — shown for discussion only;
+#     threshold was locked on val.h5 prior to test-set evaluation."
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_threshold_sensitivity_analysis(
+    joint_df: pd.DataFrame,
+    locked_threshold: float,
+    has_incidents: bool,
+) -> Optional[dict]:
+    """
+    Post-hoc sweep of avg_prob threshold (0.02 → 0.99, step 0.01).
+
+    Returns a dict summarising the zero-FAR operating point, or None if no
+    incident data is available (FAR-only mode makes this analysis trivial).
+
+    Saves:
+      threshold_sensitivity.png  — DR and FAR vs threshold (primary figure)
+      threshold_sensitivity_drfar.png — DR vs FAR trade-off curve
+      threshold_sensitivity.csv  — full sweep table
+    """
+    if not has_incidents:
+        print("\n  ⚠️  Threshold sensitivity skipped — no incident scenarios in this set.")
+        return None
+
+    print(f"\n{'═'*70}")
+    print("  POST-HOC ANALYSIS A: AVG-PROB THRESHOLD SENSITIVITY")
+    print("═" * 70)
+    print("""
+  ⚠️  DATA-LEAKAGE DISCLAIMER
+  The threshold is swept on the SAME data used for final evaluation.
+  This is intentionally post-hoc. The locked threshold (fusion_settings.json)
+  remains the primary result. Presented for thesis discussion only.
+""")
+
+    thresholds = np.arange(0.02, 1.00, 0.01)
+    rows = []
+    for thr in thresholds:
+        preds = (joint_df["avg_prob"] >= thr).astype(int)
+        tp = int(((joint_df["has_incident"] == 1) & (preds == 1)).sum())
+        fn = int(((joint_df["has_incident"] == 1) & (preds == 0)).sum())
+        fp = int(((joint_df["has_incident"] == 0) & (preds == 1)).sum())
+        tn = int(((joint_df["has_incident"] == 0) & (preds == 0)).sum())
+        dr  = tp / max(tp + fn, 1) * 100
+        far = fp / max(fp + tn, 1) * 100
+        f1  = 2 * tp / max(2 * tp + fp + fn, 1)
+        rows.append(dict(threshold=round(float(thr), 2), dr=dr, far=far, f1=f1,
+                         tp=tp, fn=fn, fp=fp, tn=tn))
+
+    sweep_df = pd.DataFrame(rows)
+
+    # ── Key operating points ────────────────────────────────────────────────
+    # 1. The locked threshold (primary result)
+    locked_row = sweep_df.iloc[(sweep_df["threshold"] - locked_threshold).abs().argsort()[:1]]
+
+    # 2. Zero-FAR threshold: highest threshold where FAR=0
+    zero_far_rows = sweep_df[sweep_df["far"] == 0.0]
+    if not zero_far_rows.empty:
+        zero_far_row = zero_far_rows.loc[zero_far_rows["threshold"].idxmin()]  # lowest thr → highest DR at FAR=0
+    else:
+        zero_far_row = None
+
+    # 3. Best F1 operating point
+    best_f1_row = sweep_df.loc[sweep_df["f1"].idxmax()]
+
+    print(f"  Locked threshold (from val.h5 calibration):  "
+          f"thr={locked_threshold:.2f}  "
+          f"DR={float(locked_row['dr'].iloc[0]):.1f}%  "
+          f"FAR={float(locked_row['far'].iloc[0]):.2f}%")
+    if zero_far_row is not None:
+        print(f"  Zero-FAR operating point (post-hoc):         "
+              f"thr={zero_far_row['threshold']:.2f}  "
+              f"DR={zero_far_row['dr']:.1f}%  FAR=0.00%")
+    print(f"  Best-F1 operating point (post-hoc):          "
+          f"thr={best_f1_row['threshold']:.2f}  "
+          f"DR={best_f1_row['dr']:.1f}%  FAR={best_f1_row['far']:.2f}%  "
+          f"F1={best_f1_row['f1']:.4f}")
+
+    # ── Figure 1: DR and FAR vs threshold ───────────────────────────────────
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    ax.plot(sweep_df["threshold"], sweep_df["dr"],
+            color="steelblue", linewidth=2.0, label="Detection Rate (%)")
+    ax.plot(sweep_df["threshold"], sweep_df["far"],
+            color="tomato", linewidth=2.0, label="False Alarm Rate (%)")
+
+    # Mark the locked threshold
+    locked_dr  = float(locked_row["dr"].iloc[0])
+    locked_far = float(locked_row["far"].iloc[0])
+    ax.axvline(locked_threshold, color="navy", linestyle="--", linewidth=1.5,
+               label=f"Locked threshold (thr={locked_threshold:.2f})")
+    ax.scatter([locked_threshold], [locked_dr],  color="steelblue", s=90, zorder=5)
+    ax.scatter([locked_threshold], [locked_far], color="tomato",    s=90, zorder=5)
+
+    # Mark the zero-FAR point
+    if zero_far_row is not None:
+        ax.axvline(zero_far_row["threshold"], color="seagreen", linestyle=":",
+                   linewidth=1.5,
+                   label=f"Zero-FAR point (thr={zero_far_row['threshold']:.2f}, "
+                         f"DR={zero_far_row['dr']:.1f}%)")
+        ax.scatter([zero_far_row["threshold"]], [zero_far_row["dr"]],
+                   color="seagreen", s=90, marker="D", zorder=5)
+
+    ax.set_xlabel("avg_prob threshold", fontsize=11)
+    ax.set_ylabel("Rate (%)", fontsize=11)
+    ax.set_title(
+        "Post-hoc Threshold Sensitivity — Average-Probability Fusion\n"
+        "⚠  Sweep performed on test data (data-leakage aware — for discussion only)",
+        fontsize=10,
+    )
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(-2, 105)
+    plt.tight_layout()
+    path1 = OUTPUT_DIR / "threshold_sensitivity.png"
+    plt.savefig(path1, dpi=150)
+    plt.close()
+    print(f"\n  💾 DR/FAR vs threshold → {path1.name}")
+
+    # ── Figure 2: DR vs FAR trade-off curve ─────────────────────────────────
+    fig, ax = plt.subplots(figsize=(7, 6))
+    sc = ax.scatter(
+        sweep_df["far"], sweep_df["dr"],
+        c=sweep_df["threshold"], cmap="viridis_r",
+        s=25, zorder=3,
+    )
+    ax.plot(sweep_df["far"], sweep_df["dr"],
+            color="gray", linewidth=0.8, alpha=0.5, zorder=2)
+    plt.colorbar(sc, ax=ax, label="avg_prob threshold")
+
+    # Mark locked threshold
+    ax.scatter([locked_far], [locked_dr], color="navy", s=120,
+               marker="*", zorder=6,
+               label=f"Locked (thr={locked_threshold:.2f})")
+
+    # Mark zero-FAR point
+    if zero_far_row is not None:
+        ax.scatter([0], [zero_far_row["dr"]], color="seagreen", s=120,
+                   marker="D", zorder=6,
+                   label=f"Zero-FAR (thr={zero_far_row['threshold']:.2f}, "
+                         f"DR={zero_far_row['dr']:.1f}%)")
+
+    ax.set_xlabel("False Alarm Rate (%)", fontsize=11)
+    ax.set_ylabel("Detection Rate (%)", fontsize=11)
+    ax.set_title(
+        "DR vs FAR Trade-off — Average-Probability Fusion\n"
+        "⚠  Post-hoc sweep on test data (for discussion only)",
+        fontsize=10,
+    )
+    ax.legend(fontsize=9)
+    ax.grid(alpha=0.3)
+    ax.set_xlim(-1, max(sweep_df["far"].max() * 1.1, 5))
+    ax.set_ylim(-2, 105)
+    plt.tight_layout()
+    path2 = OUTPUT_DIR / "threshold_sensitivity_drfar.png"
+    plt.savefig(path2, dpi=150)
+    plt.close()
+    print(f"  💾 DR vs FAR trade-off curve → {path2.name}")
+
+    # ── CSV ──────────────────────────────────────────────────────────────────
+    csv_path = OUTPUT_DIR / "threshold_sensitivity.csv"
+    sweep_df.to_csv(csv_path, index=False)
+    print(f"  💾 Full sweep table → {csv_path.name}")
+
+    result = {
+        "locked_threshold": locked_threshold,
+        "locked_dr":        locked_dr,
+        "locked_far":       locked_far,
+    }
+    if zero_far_row is not None:
+        result["zero_far_threshold"] = float(zero_far_row["threshold"])
+        result["zero_far_dr"]        = float(zero_far_row["dr"])
+
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9a. California Algorithm — shared helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_CAL_REQUIRED_COLS = [
+    "det3_occupancy", "det3_speed_mean",
+    "scenario_id", "sim_time", "incident_active", "has_incident",
+]
+
+
+def _group_macro_for_cal(macro_df: pd.DataFrame) -> dict:
+    """Pre-group macro DataFrame by scenario_id. Raises ValueError if columns missing."""
+    missing = [c for c in _CAL_REQUIRED_COLS if c not in macro_df.columns]
+    if missing:
+        raise ValueError(f"Missing columns for California Algorithm: {missing}")
+    return {sid: grp.sort_values("sim_time").reset_index(drop=True)
+            for sid, grp in macro_df.groupby("scenario_id")}
+
+
+def _eval_cal_scenarios(
+    grouped: dict, v_thr: float, o_thr: float, p_s: int
+) -> dict:
+    """
+    Evaluate one parameter configuration on a pre-grouped scenario dict.
+
+    Returns aggregate metrics PLUS per-scenario TTD list (None = not detected).
+    This is the single evaluation kernel shared by calibration, locked evaluation,
+    and the post-hoc sweep.
+    """
+    tp = fn = fp = tn = 0
+    ttd_list: List[Optional[float]] = []
+
+    for sid, grp in grouped.items():
+        has_inc     = int(grp["has_incident"].max())
+        speed       = grp["det3_speed_mean"].values
+        occ         = grp["det3_occupancy"].values
+        inc_act     = grp["incident_active"].values
+        times       = grp["sim_time"].values
+        cond        = ((speed < v_thr) & (occ > o_thr)).astype(int)
+        consec      = 0
+        alarm_t     = None
+        inc_start_t = None
+
+        for i in range(len(cond)):
+            if inc_act[i] == 1 and inc_start_t is None:
+                inc_start_t = float(times[i])
+            consec = consec + 1 if cond[i] == 1 else 0
+            if consec >= p_s and alarm_t is None:
+                alarm_t = float(times[i])
+
+        alarm_after = (alarm_t is not None and inc_start_t is not None
+                       and alarm_t >= inc_start_t)
+
+        if has_inc:
+            if alarm_after:
+                tp += 1
+                ttd_list.append(float(alarm_t - inc_start_t))
+            else:
+                fn += 1
+                ttd_list.append(None)
+        else:
+            if alarm_t is not None:
+                fp += 1
+            else:
+                tn += 1
+
+    dr  = tp / max(tp + fn, 1)
+    far = fp / max(fp + tn, 1)
+    f1  = 2 * tp / max(2 * tp + fp + fn, 1)
+    return dict(tp=tp, fn=fn, fp=fp, tn=tn, dr=dr, far=far, f1=f1,
+                ttd_list=ttd_list, speed_thr=v_thr, occ_thr=o_thr, persist_s=p_s)
+
+
+def _cal_grid_sweep(grouped: dict) -> pd.DataFrame:
+    """Run the full CAL_SPEED_THRS × CAL_OCC_THRS × CAL_PERSIST_SEC grid.
+    Returns a tidy DataFrame (ttd_list excluded — not serialisable)."""
+    n = len(CAL_SPEED_THRS) * len(CAL_OCC_THRS) * len(CAL_PERSIST_SEC)
+    print(f"  Sweeping {n} parameter combinations ...")
+    rows = []
+    for v in CAL_SPEED_THRS:
+        for o in CAL_OCC_THRS:
+            for p in CAL_PERSIST_SEC:
+                r = _eval_cal_scenarios(grouped, v, o, p)
+                r.pop("ttd_list")
+                rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def _best_cal_row(results_df: pd.DataFrame) -> pd.Series:
+    """Maximize DR subject to FAR ≤ MAX_FAR_CONSTRAINT; fall back to lowest-FAR."""
+    constrained = results_df[results_df["far"] <= MAX_FAR_CONSTRAINT]
+    if not constrained.empty:
+        return constrained.loc[constrained["dr"].idxmax()]
+    return results_df.loc[results_df["far"].idxmin()]
+
+
+def _cal_row_to_metrics(row: pd.Series, selected_on: str) -> dict:
+    """Convert a grid-sweep result row into a standard metrics dict."""
+    tp, fp = int(row["tp"]), int(row["fp"])
+    return {
+        "model":       "California Alg.",
+        "dr":          float(row["dr"]),
+        "far":         float(row["far"]),
+        "f1":          float(row["f1"]),
+        "tp":          tp,
+        "fn":          int(row["fn"]),
+        "fp":          fp,
+        "tn":          int(row["tn"]),
+        "precision":   tp / max(tp + fp, 1),
+        "recall":      float(row["dr"]),
+        "threshold":   (f"V<{row['speed_thr']:.0f}m/s & "
+                        f"O>{row['occ_thr']*100:.0f}%, "
+                        f"persist={int(row['persist_s'])}s"),
+        "selected_on": selected_on,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9b. California Algorithm — calibration (val.h5)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_california_calibration(
+    macro_df: pd.DataFrame, has_incidents: bool,
+) -> dict:
+    """
+    CALIBRATION MODE: sweep the full grid on val.h5, select best configuration
+    under FAR ≤ MAX_FAR_CONSTRAINT, and save to california_settings.json.
+
+    This mirrors exactly what run_fusion_evaluation() does for ML fusion:
+    parameters are selected on val.h5 ONLY and locked before any test set
+    is evaluated.
+
+    Returns a metrics dict for the calibration-set summary (indicative;
+    final thesis numbers come from the locked evaluation on test.h5).
+    """
+    print("\n" + "="*60)
+    print("  CALIFORNIA ALGORITHM — CALIBRATION")
+    print("="*60)
+    print(f"  Alarm : det3_speed < V  AND  det3_occ > O  for P seconds")
+    print(f"  Goal  : maximize DR  subject to FAR ≤ {MAX_FAR_CONSTRAINT*100:.1f}%")
+
+    try:
+        grouped = _group_macro_for_cal(macro_df)
+    except ValueError as e:
+        print(f"  ❌ {e}\n  California Algorithm skipped.")
+        return {}
+
+    results_df = _cal_grid_sweep(grouped)
+    best = _best_cal_row(results_df)
+
+    constrained_ok = float(best["far"]) <= MAX_FAR_CONSTRAINT
+    if not constrained_ok:
+        print(f"  ⚠️  No config satisfies FAR ≤ {MAX_FAR_CONSTRAINT*100:.1f}% "
+              f"— saving lowest-FAR config.")
+
+    settings = {
+        "speed_thr": float(best["speed_thr"]),
+        "occ_thr":   float(best["occ_thr"]),
+        "persist_s": int(best["persist_s"]),
+    }
+    with open(CAL_SETTINGS_PATH, "w") as f:
+        json.dump(settings, f, indent=2)
+
+    print(f"\n  Selected config (val.h5):")
+    print(f"    Speed < {best['speed_thr']:.1f} m/s ({best['speed_thr']*3.6:.0f} km/h)  |  "
+          f"Occ > {best['occ_thr']*100:.0f}%  |  Persist {int(best['persist_s'])}s")
+    print(f"    DR={best['dr']:.2%}  FAR={best['far']:.2%}  F1={best['f1']:.4f}")
+    print(f"  💾 california_settings.json saved → {CAL_SETTINGS_PATH.name}")
+    print(f"     Parameters LOCKED — will not change on test/NI evaluation runs.")
+
+    csv_path = OUTPUT_DIR / "california_calibration_sweep.csv"
+    results_df.to_csv(csv_path, index=False)
+    print(f"  💾 Calibration sweep → {csv_path.name}")
+
+    if has_incidents:
+        _plot_california_heatmap(results_df, title_suffix="calibration — val.h5")
+
+    return _cal_row_to_metrics(best, selected_on="val.h5 calibration")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9c. California Algorithm — evaluation (test.h5 / all_data.h5)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_california_evaluation(
+    macro_df: pd.DataFrame, settings: dict, has_incidents: bool,
+) -> Tuple[dict, List[Optional[float]]]:
+    """
+    EVALUATION MODE: apply locked parameters from california_settings.json.
+    No sweeping — parameters are fixed from calibration.
+
+    Returns (metrics_dict, ttd_list).
+    ttd_list contains one entry per incident scenario: the TTD in seconds, or
+    None if the scenario was not detected.  Used for the TTD comparison plot.
+    """
+    print("\n" + "="*60)
+    print("  CALIFORNIA ALGORITHM — EVALUATION  (locked parameters)")
+    print("="*60)
+
+    v = float(settings["speed_thr"])
+    o = float(settings["occ_thr"])
+    p = int(settings["persist_s"])
+    print(f"  Speed < {v:.1f} m/s ({v*3.6:.0f} km/h)  |  "
+          f"Occ > {o*100:.0f}%  |  Persist {p}s")
+    print(f"  (locked from {CAL_SETTINGS_PATH.name})")
+
+    try:
+        grouped = _group_macro_for_cal(macro_df)
+    except ValueError as e:
+        print(f"  ❌ {e}\n  California Algorithm skipped.")
+        return {}, []
+
+    result = _eval_cal_scenarios(grouped, v, o, p)
+    ttd_list = result.pop("ttd_list")
+
+    print(f"\n  TP={result['tp']}  FN={result['fn']}  FP={result['fp']}  TN={result['tn']}")
+    print(f"  DR={result['dr']:.2%}  FAR={result['far']:.2%}  F1={result['f1']:.4f}")
+    if has_incidents:
+        valid = [t for t in ttd_list if t is not None]
+        if valid:
+            print(f"  Median TTD: {np.median(valid):.1f}s  "
+                  f"(n_detected={len(valid)})")
+
+    metrics = _cal_row_to_metrics(pd.Series(result), selected_on="locked from val.h5")
+    return metrics, ttd_list
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9d. California Algorithm — post-hoc data-leakage sweep (stays at the end)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_california_posthoc_sweep(
+    macro_df: pd.DataFrame, has_incidents: bool,
+) -> Optional[dict]:
+    """
+    POST-HOC: sweep the parameter grid on the SAME data used for evaluation.
+
+    ⚠️  DATA-LEAKAGE DISCLAIMER
+    Parameters are selected on the test set itself.  This is intentionally
+    post-hoc.  The locked config from california_settings.json (calibrated
+    on val.h5) is the primary result.  This sweep is shown only to illustrate
+    the best theoretically achievable performance of the California Algorithm
+    and to identify operating points for thesis discussion.
+    Label any resulting figure:
+      "Post-hoc parameter sweep — shown for discussion only;
+       parameters were locked on val.h5 prior to test-set evaluation."
+    """
+    print(f"\n{'═'*70}")
+    print("  POST-HOC ANALYSIS B: CALIFORNIA ALGORITHM — DATA-LEAKAGE SWEEP")
+    print("═" * 70)
+    print("""
+  ⚠️  DATA-LEAKAGE DISCLAIMER
+  Parameters selected on the SAME data used for evaluation.
+  The locked config (california_settings.json) is the primary result.
+  Presented for thesis discussion / upper-bound reference only.
+""")
+
+    try:
+        grouped = _group_macro_for_cal(macro_df)
+    except ValueError as e:
+        print(f"  ❌ {e}\n  Post-hoc sweep skipped.")
+        return None
+
+    results_df = _cal_grid_sweep(grouped)
+    best = _best_cal_row(results_df)
+
+    constrained = results_df[results_df["far"] <= MAX_FAR_CONSTRAINT]
+    note = (f"FAR ≤ {MAX_FAR_CONSTRAINT*100:.1f}% satisfied"
+            if not constrained.empty
+            else f"⚠  No config satisfies FAR ≤ {MAX_FAR_CONSTRAINT*100:.1f}%")
+
+    best_f1_row = results_df.loc[results_df["f1"].idxmax()]
+
+    print(f"  {note}")
+    print(f"\n  Best (maximize DR, FAR≤{MAX_FAR_CONSTRAINT*100:.1f}%):")
+    print(f"    Speed < {best['speed_thr']:.1f} m/s ({best['speed_thr']*3.6:.0f} km/h)  |  "
+          f"Occ > {best['occ_thr']*100:.0f}%  |  Persist {int(best['persist_s'])}s")
+    print(f"    DR={best['dr']:.2%}  FAR={best['far']:.2%}  F1={best['f1']:.4f}")
+
+    if best_f1_row["f1"] > best["f1"]:
+        print(f"\n  Best-F1 (post-hoc reference):")
+        print(f"    Speed < {best_f1_row['speed_thr']:.1f} m/s  |  "
+              f"Occ > {best_f1_row['occ_thr']*100:.0f}%  |  "
+              f"Persist {int(best_f1_row['persist_s'])}s")
+        print(f"    DR={best_f1_row['dr']:.2%}  FAR={best_f1_row['far']:.2%}  "
+              f"F1={best_f1_row['f1']:.4f}")
+
+    if has_incidents:
+        _plot_california_heatmap(results_df, title_suffix="post-hoc — test data ⚠ leakage")
+
+    csv_path = OUTPUT_DIR / "california_posthoc_sweep.csv"
+    results_df.to_csv(csv_path, index=False)
+    print(f"\n  💾 Post-hoc sweep → {csv_path.name}")
+
+    return _cal_row_to_metrics(best, selected_on="post-hoc (test set — data leakage)")
+
+
+def _plot_california_heatmap(
+    results_df: pd.DataFrame,
+    title_suffix: str = "",
+) -> None:
+    """DR and FAR heatmaps across speed_thr × occ_thr, best persistence per cell."""
+    speed_thrs = sorted(results_df["speed_thr"].unique())
+    occ_thrs   = sorted(results_df["occ_thr"].unique())
+
+    dr_grid  = np.full((len(speed_thrs), len(occ_thrs)), np.nan)
+    far_grid = np.full((len(speed_thrs), len(occ_thrs)), np.nan)
+    persist_grid = np.full((len(speed_thrs), len(occ_thrs)), np.nan)
+
+    for i, v in enumerate(speed_thrs):
+        for j, o in enumerate(occ_thrs):
+            cell = results_df[
+                (results_df["speed_thr"] == v) & (results_df["occ_thr"] == o)
+            ]
+            constrained = cell[cell["far"] <= MAX_FAR_CONSTRAINT]
+            best = (constrained.loc[constrained["dr"].idxmax()]
+                    if not constrained.empty
+                    else cell.loc[cell["far"].idxmin()])
+            dr_grid[i, j]      = best["dr"] * 100
+            far_grid[i, j]     = best["far"] * 100
+            persist_grid[i, j] = best["persist_s"]
+
+    speed_labels = [f"{v*3.6:.0f}" for v in speed_thrs]
+    occ_labels   = [f"{o*100:.0f}%" for o in occ_thrs]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    for ax, grid, metric_name, cmap in [
+        (axes[0], dr_grid,  "Detection Rate (%)",   "Blues"),
+        (axes[1], far_grid, "False Alarm Rate (%)", "Reds"),
+    ]:
+        im = ax.imshow(grid, cmap=cmap, aspect="auto", vmin=0, vmax=100)
+        plt.colorbar(im, ax=ax)
+        ax.set_xticks(range(len(occ_thrs)))
+        ax.set_xticklabels(occ_labels, fontsize=8)
+        ax.set_yticks(range(len(speed_thrs)))
+        ax.set_yticklabels(speed_labels, fontsize=8)
+        ax.set_xlabel("Occupancy threshold", fontsize=10)
+        ax.set_ylabel("Speed threshold (km/h)", fontsize=10)
+        ax.set_title(
+            f"California Algorithm — {metric_name}\n"
+            f"({title_suffix}  |  best persist per cell, "
+            f"FAR≤{MAX_FAR_CONSTRAINT*100:.1f}% preferred)",
+            fontsize=9,
+        )
+        for i in range(len(speed_thrs)):
+            for j in range(len(occ_thrs)):
+                val = grid[i, j]
+                p_s = int(persist_grid[i, j])
+                ax.text(j, i, f"{val:.0f}\n({p_s}s)", ha="center", va="center",
+                        fontsize=6.5,
+                        color="white" if val > 55 else "black")
+
+    tag = title_suffix.replace(" ", "_").replace("—", "").replace("⚠", "").strip("_")
+    plt.suptitle(
+        f"California Algorithm — Parameter Grid  ({title_suffix})",
+        fontsize=10,
+    )
+    plt.tight_layout()
+    fname = f"california_heatmap_{tag}.png" if tag else "california_heatmap.png"
+    path = OUTPUT_DIR / fname
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  💾 California heatmap → {path.name}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 10. Additional diagnostic plots
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def plot_confusion_matrices(
+    rf_m: dict,
+    cnn_m: Optional[dict],
+    cal_m: Optional[dict],
+    best_fusion_m: Optional[dict],
+    has_incidents: bool,
+) -> None:
+    """
+    Side-by-side confusion-matrix heatmaps for every available model.
+    Normalised by true label (rows sum to 1) so absolute scenario counts
+    don't distort the visual when set sizes differ.
+    """
+    if not has_incidents:
+        return
+
+    panels = [("RF", rf_m)]
+    if cnn_m:
+        panels.append(("CNN", cnn_m))
+    if cal_m:
+        panels.append(("Cal. Alg.", cal_m))
+    if best_fusion_m:
+        label = best_fusion_m.get("model", "Best fusion")[:14]
+        panels.append((label, best_fusion_m))
+
+    n = len(panels)
+    fig, axes = plt.subplots(1, n, figsize=(4 * n, 3.8))
+    if n == 1:
+        axes = [axes]
+
+    for ax, (name, m) in zip(axes, panels):
+        tp = m.get("tp", 0)
+        fn = m.get("fn", 0)
+        fp = m.get("fp", 0)
+        tn = m.get("tn", 0)
+        # Normalise rows (actual positives / actual negatives)
+        pos_total = max(tp + fn, 1)
+        neg_total = max(fp + tn, 1)
+        mat = np.array([
+            [tp / pos_total, fn / pos_total],
+            [fp / neg_total, tn / neg_total],
+        ])
+        im = ax.imshow(mat, cmap="Blues", vmin=0, vmax=1)
+        for (r, c), val in np.ndenumerate(mat):
+            ax.text(c, r, f"{val:.2f}", ha="center", va="center",
+                    fontsize=11,
+                    color="white" if val > 0.55 else "black")
+        ax.set_xticks([0, 1])
+        ax.set_xticklabels(["Pred: Incident", "Pred: Normal"], fontsize=8)
+        ax.set_yticks([0, 1])
+        ax.set_yticklabels(["True: Incident", "True: Normal"], fontsize=8)
+        ax.set_title(f"{name}\nDR={m.get('dr',0):.0%}  FAR={m.get('far',0):.0%}",
+                     fontsize=9)
+    plt.colorbar(im, ax=axes[-1], shrink=0.8, label="Fraction")
+    plt.suptitle("Confusion Matrices — row-normalised (scenario level)", fontsize=10)
+    plt.tight_layout()
+    path = OUTPUT_DIR / "confusion_matrices.png"
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  💾 Confusion matrices → {path.name}")
+
+
+def plot_precision_recall_curves(
+    joint_df: pd.DataFrame, has_incidents: bool,
+) -> None:
+    """
+    Precision-Recall curves for RF, CNN, and average-probability fusion.
+    Average Precision (AP) shown in the legend.
+    """
+    from sklearn.metrics import precision_recall_curve, average_precision_score
+
+    if not has_incidents or joint_df is None:
+        return
+
+    y = joint_df["has_incident"].values
+    if y.sum() == 0:
+        return
+
+    cols = {
+        "RF":           "rf_max_prob",
+        "CNN":          "cnn_max_prob",
+        "Average prob": "avg_prob",
+        "Max prob":     "max_prob",
+    }
+
+    plt.figure(figsize=(7, 6))
+    for label, col in cols.items():
+        if col not in joint_df.columns:
+            continue
+        prec, rec, _ = precision_recall_curve(y, joint_df[col].values)
+        ap = average_precision_score(y, joint_df[col].values)
+        plt.plot(rec, prec, linewidth=1.8, label=f"{label}  (AP={ap:.3f})")
+
+    # Baseline: random classifier
+    baseline = y.mean()
+    plt.axhline(baseline, color="gray", linestyle="--", alpha=0.5,
+                label=f"Random (prevalence={baseline:.2f})")
+
+    plt.xlabel("Recall (Detection Rate)", fontsize=11)
+    plt.ylabel("Precision", fontsize=11)
+    plt.title("Precision-Recall Curves — Scenario Level", fontsize=11)
+    plt.legend(fontsize=9)
+    plt.grid(alpha=0.3)
+    plt.xlim(-0.02, 1.02)
+    plt.ylim(-0.02, 1.08)
+    plt.tight_layout()
+    path = OUTPUT_DIR / "precision_recall_curves.png"
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  💾 Precision-Recall curves → {path.name}")
+
+
+def plot_ttd_comparison(
+    rf_scen_df: pd.DataFrame,
+    cnn_scen_df: Optional[pd.DataFrame],
+    cal_ttd: List[Optional[float]],
+    has_incidents: bool,
+) -> None:
+    """
+    Box + strip plot comparing Time-To-Detection distributions across models.
+    Only incident scenarios that were actually detected are included (NaN dropped).
+    """
+    if not has_incidents:
+        return
+
+    data, labels = [], []
+
+    rf_ttd = rf_scen_df.loc[rf_scen_df["has_incident"] == 1, "rf_ttd"].dropna().values
+    if len(rf_ttd):
+        data.append(rf_ttd)
+        labels.append(f"RF\n(n={len(rf_ttd)})")
+
+    if cnn_scen_df is not None:
+        cnn_ttd = cnn_scen_df.loc[cnn_scen_df["has_incident"] == 1, "cnn_ttd"].dropna().values
+        if len(cnn_ttd):
+            data.append(cnn_ttd)
+            labels.append(f"CNN\n(n={len(cnn_ttd)})")
+
+    cal_valid = [t for t in cal_ttd if t is not None]
+    if cal_valid:
+        data.append(np.array(cal_valid))
+        labels.append(f"Cal. Alg.\n(n={len(cal_valid)})")
+
+    if not data:
+        return
+
+    fig, ax = plt.subplots(figsize=(max(6, len(data) * 2), 5))
+    bp = ax.boxplot(data, patch_artist=True, notch=False,
+                    medianprops=dict(color="white", linewidth=2))
+
+    colors = ["#4682B4", "#E07B54", "#DAA520", "#2E8B57"]
+    for patch, color in zip(bp["boxes"], colors[:len(data)]):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.7)
+
+    # Overlay individual points (jittered)
+    for i, arr in enumerate(data, start=1):
+        jitter = np.random.uniform(-0.12, 0.12, size=len(arr))
+        ax.scatter(i + jitter, arr, alpha=0.35, s=14,
+                   color=colors[i - 1], zorder=3)
+
+    ax.axhline(0, color="gray", linestyle=":", alpha=0.4)
+    ax.set_xticks(range(1, len(labels) + 1))
+    ax.set_xticklabels(labels, fontsize=10)
+    ax.set_ylabel("Time-to-detection (seconds from incident start)", fontsize=10)
+    ax.set_title("Time-to-Detection Comparison  (detected incident scenarios only)",
+                 fontsize=10)
+    ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    path = OUTPUT_DIR / "ttd_comparison.png"
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  💾 TTD comparison → {path.name}")
+
+
+def plot_per_flow_performance(
+    macro_eng: pd.DataFrame,
+    rf_scen_df: pd.DataFrame,
+    cal_settings: Optional[dict],
+    has_incidents: bool,
+) -> None:
+    """
+    DR and FAR broken down by traffic flow bucket for RF and California Algorithm.
+
+    Shows where each method struggles (very low flows have thin traffic so
+    det3 occupancy is naturally low; very high flows may pre-saturate the
+    detectors).  Useful for understanding generalisation to different conditions.
+    """
+    if not has_incidents:
+        return
+
+    # ── Map flow_total from macro_eng onto rf_scen_df ────────────────────────
+    flow_map = (macro_eng.groupby("scenario_id")["flow_total"].first()
+                if "flow_total" in macro_eng.columns else None)
+    if flow_map is None:
+        print("  ⚠️  flow_total column not found — per-flow plot skipped.")
+        return
+
+    scen = rf_scen_df.copy()
+    scen["flow_total"] = scen["scenario_id"].map(flow_map)
+    scen = scen.dropna(subset=["flow_total"])
+    if scen.empty:
+        return
+
+    # ── Bin flows ─────────────────────────────────────────────────────────────
+    flow_min = int(scen["flow_total"].min())
+    flow_max = int(scen["flow_total"].max())
+    bins = list(range(0, flow_max + 401, 400))
+    scen["flow_bin"] = pd.cut(scen["flow_total"], bins=bins)
+    bin_labels = [f"{b.left:.0f}–{b.right:.0f}" for b in scen["flow_bin"].cat.categories]
+
+    # ── RF per-bin metrics ────────────────────────────────────────────────────
+    rf_dr_vals, rf_far_vals, bin_counts = [], [], []
+    for cat in scen["flow_bin"].cat.categories:
+        sub = scen[scen["flow_bin"] == cat]
+        if sub.empty:
+            rf_dr_vals.append(np.nan)
+            rf_far_vals.append(np.nan)
+            bin_counts.append(0)
+            continue
+        m = _scenario_metrics(sub, "rf_detected")
+        rf_dr_vals.append(m["dr"] * 100)
+        rf_far_vals.append(m["far"] * 100)
+        bin_counts.append(len(sub))
+
+    # ── California per-bin metrics ────────────────────────────────────────────
+    cal_dr_vals, cal_far_vals = [], []
+    if cal_settings:
+        v = float(cal_settings["speed_thr"])
+        o = float(cal_settings["occ_thr"])
+        p = int(cal_settings["persist_s"])
+        for cat in scen["flow_bin"].cat.categories:
+            sub_ids = set(scen[scen["flow_bin"] == cat]["scenario_id"])
+            if not sub_ids:
+                cal_dr_vals.append(np.nan)
+                cal_far_vals.append(np.nan)
+                continue
+            sub_macro = macro_eng[macro_eng["scenario_id"].isin(sub_ids)]
+            try:
+                grouped = _group_macro_for_cal(sub_macro)
+                res = _eval_cal_scenarios(grouped, v, o, p)
+                cal_dr_vals.append(res["dr"] * 100)
+                cal_far_vals.append(res["far"] * 100)
+            except Exception:
+                cal_dr_vals.append(np.nan)
+                cal_far_vals.append(np.nan)
+
+    # ── Plot ──────────────────────────────────────────────────────────────────
+    x = np.arange(len(bin_labels))
+    fig, axes = plt.subplots(2, 1, figsize=(max(9, len(bin_labels) * 1.4), 8),
+                             sharex=True)
+    w = 0.35
+
+    for ax, vals_rf, vals_cal, metric, color_rf, color_cal in [
+        (axes[0], rf_dr_vals,  cal_dr_vals  if cal_settings else [],
+         "Detection Rate (%)",  "steelblue", "#B8860B"),
+        (axes[1], rf_far_vals, cal_far_vals if cal_settings else [],
+         "False Alarm Rate (%)", "tomato",    "#CD853F"),
+    ]:
+        bars_rf = ax.bar(x - w/2, vals_rf, w, label="RF (locked thr)",
+                         color=color_rf, alpha=0.8)
+        if cal_settings and vals_cal:
+            ax.bar(x + w/2, vals_cal, w, label="Cal. Alg. (locked)",
+                   color=color_cal, alpha=0.8)
+        ax.set_ylabel(metric, fontsize=10)
+        ax.set_ylim(-2, 105)
+        ax.axhline(100 if "Detection" in metric else 0, color="gray",
+                   linestyle=":", alpha=0.4)
+        ax.legend(fontsize=9)
+        ax.grid(axis="y", alpha=0.3)
+
+    # Annotate scenario counts on top of DR bar
+    for bar, cnt in zip(bars_rf, bin_counts):
+        if cnt > 0:
+            axes[0].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1.5,
+                         f"n={cnt}", ha="center", va="bottom", fontsize=7, color="navy")
+
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels(bin_labels, rotation=20, ha="right", fontsize=9)
+    axes[1].set_xlabel("Total mainline flow (veh/h)", fontsize=10)
+
+    plt.suptitle("Per-Flow Performance — RF vs California Algorithm (locked parameters)",
+                 fontsize=10)
+    plt.tight_layout()
+    path = OUTPUT_DIR / "per_flow_performance.png"
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  💾 Per-flow performance → {path.name}")
+
+
+def plot_california_timeseries(
+    macro_eng: pd.DataFrame,
+    cal_settings: Optional[dict],
+    n_examples: int = 3,
+) -> None:
+    """
+    Time-series traces for a sample of incident scenarios showing:
+      • det3 speed (m/s)  — drops when incident starts
+      • det3 occupancy (%)
+      • Alarm condition (speed < V AND occ > O) — shaded regions
+      • incident_active label (red shading)
+      • Alarm fired marker (vertical dashed line)
+
+    Helps visualise WHY the algorithm detects or misses specific scenarios.
+    """
+    if cal_settings is None:
+        return
+
+    required = _CAL_REQUIRED_COLS + ["flow_total"]
+    if any(c not in macro_eng.columns for c in _CAL_REQUIRED_COLS):
+        return
+
+    v = float(cal_settings["speed_thr"])
+    o = float(cal_settings["occ_thr"])
+    p = int(cal_settings["persist_s"])
+
+    # Pick incident scenarios, prefer mix of detected + missed
+    inc_ids = (macro_eng[macro_eng["has_incident"] == 1]
+               ["scenario_id"].unique())
+    if len(inc_ids) == 0:
+        return
+
+    rng = np.random.default_rng(0)
+    chosen = rng.choice(inc_ids, size=min(n_examples, len(inc_ids)), replace=False)
+
+    fig, axes = plt.subplots(len(chosen), 1,
+                             figsize=(12, 4.5 * len(chosen)),
+                             sharex=False)
+    if len(chosen) == 1:
+        axes = [axes]
+
+    for ax, sid in zip(axes, chosen):
+        grp = (macro_eng[macro_eng["scenario_id"] == sid]
+               .sort_values("sim_time").reset_index(drop=True))
+        t        = grp["sim_time"].values
+        spd      = grp["det3_speed_mean"].values
+        occ_pct  = grp["det3_occupancy"].values * 100
+        inc_act  = grp["incident_active"].values
+        cond     = ((grp["det3_speed_mean"].values < v) &
+                    (grp["det3_occupancy"].values > o)).astype(int)
+
+        # Persistence → alarm fire time
+        consec, alarm_t, inc_start_t = 0, None, None
+        for i in range(len(cond)):
+            if inc_act[i] == 1 and inc_start_t is None:
+                inc_start_t = t[i]
+            consec = consec + 1 if cond[i] == 1 else 0
+            if consec >= p and alarm_t is None:
+                alarm_t = t[i]
+
+        ax2 = ax.twinx()
+
+        ax.plot(t, spd, color="steelblue", linewidth=1.5, label="Speed (m/s)")
+        ax.axhline(v, color="steelblue", linestyle=":", alpha=0.6,
+                   label=f"Speed thr ({v:.0f} m/s)")
+        ax2.plot(t, occ_pct, color="darkorange", linewidth=1.5,
+                 alpha=0.8, label="Occupancy (%)")
+        ax2.axhline(o * 100, color="darkorange", linestyle=":", alpha=0.6,
+                    label=f"Occ thr ({o*100:.0f}%)")
+
+        # Shade incident_active region
+        in_inc = False
+        for i in range(len(t)):
+            if inc_act[i] == 1 and not in_inc:
+                inc_start_shade = t[i]
+                in_inc = True
+            elif inc_act[i] == 0 and in_inc:
+                ax.axvspan(inc_start_shade, t[i], alpha=0.12,
+                           color="red", label="Incident active" if i < 5 else "")
+                in_inc = False
+        if in_inc:
+            ax.axvspan(inc_start_shade, t[-1], alpha=0.12, color="red")
+
+        # Shade alarm condition (speed & occ both triggered)
+        in_cond = False
+        for i in range(len(cond)):
+            if cond[i] == 1 and not in_cond:
+                cond_start = t[i]
+                in_cond = True
+            elif cond[i] == 0 and in_cond:
+                ax.axvspan(cond_start, t[i], alpha=0.15,
+                           color="gold", label="Alarm condition met" if i < 10 else "")
+                in_cond = False
+        if in_cond:
+            ax.axvspan(cond_start, t[-1], alpha=0.15, color="gold")
+
+        # Mark alarm fire
+        if alarm_t is not None:
+            alarm_after = (inc_start_t is not None and alarm_t >= inc_start_t)
+            ax.axvline(alarm_t, color="green" if alarm_after else "red",
+                       linestyle="--", linewidth=2,
+                       label=f"Alarm fired ({'TP' if alarm_after else 'pre-incident'})")
+
+        flow_str = ""
+        if "flow_total" in grp.columns:
+            fv = grp["flow_total"].iloc[0]
+            flow_str = f"  |  flow={fv:.0f} veh/h"
+        ax.set_title(
+            f"Scenario {sid}{flow_str}  |  "
+            f"locked: V<{v:.0f}m/s, O>{o*100:.0f}%, persist={p}s",
+            fontsize=9,
+        )
+        ax.set_xlabel("Simulation time (s)", fontsize=9)
+        ax.set_ylabel("Speed (m/s)", fontsize=9, color="steelblue")
+        ax2.set_ylabel("Occupancy (%)", fontsize=9, color="darkorange")
+
+        lines1, labs1 = ax.get_legend_handles_labels()
+        lines2, labs2 = ax2.get_legend_handles_labels()
+        # Deduplicate labels
+        seen, uniq_lines, uniq_labs = set(), [], []
+        for ln, lb in zip(lines1 + lines2, labs1 + labs2):
+            if lb not in seen:
+                seen.add(lb)
+                uniq_lines.append(ln)
+                uniq_labs.append(lb)
+        ax.legend(uniq_lines, uniq_labs, fontsize=7, loc="upper right", ncol=2)
+        ax.grid(alpha=0.2)
+
+    plt.suptitle(
+        "California Algorithm — Time-Series Examples (locked parameters from val.h5)",
+        fontsize=10,
+    )
+    plt.tight_layout()
+    path = OUTPUT_DIR / "california_timeseries.png"
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  💾 California time-series examples → {path.name}")
+
+
+def plot_posthoc_comparison_bar(
+    rf_m: dict,
+    cnn_m: Optional[dict],
+    fusion_results: List[dict],
+    cal_m_posthoc: Optional[dict],
+    cal_m_locked: Optional[dict],
+    has_incidents: bool,
+) -> None:
+    """
+    Side-by-side bars: ML models (locked) + California locked + California post-hoc.
+    The post-hoc bar is visually separated and annotated to avoid confusion.
+    """
+    if not has_incidents:
+        return
+
+    all_models = [rf_m]
+    if cnn_m:
+        all_models.append(cnn_m)
+    all_models.extend(fusion_results)
+    if cal_m_locked:
+        all_models.append(cal_m_locked)
+    if cal_m_posthoc:
+        # Add post-hoc with a renamed model key so it's visually distinct
+        ph = dict(cal_m_posthoc)
+        ph["model"] = "Cal. Alg. (post-hoc)"
+        all_models.append(ph)
+
+    names    = [m["model"] for m in all_models]
+    dr_vals  = [m.get("dr",  0) * 100 for m in all_models]
+    far_vals = [m.get("far", 0) * 100 for m in all_models]
+    f1_vals  = [m.get("f1",  0) * 100 for m in all_models]
+
+    # Color scheme: ML models blue/green, California locked = amber, post-hoc = orange
+    def _bar_color(name, metric):
+        if name == "Cal. Alg.":
+            return {"dr": "#DAA520", "far": "#B8860B", "f1": "#8B6914"}[metric]
+        if name == "Cal. Alg. (post-hoc)":
+            return {"dr": "#E07B54", "far": "#C04828", "f1": "#8B3513"}[metric]
+        return {"dr": "#4682B4", "far": "#CD5C5C", "f1": "#2E8B57"}[metric]
+
+    x = np.arange(len(names))
+    w = 0.25
+    fig, ax = plt.subplots(figsize=(max(12, len(names) * 1.8), 6))
+    ax.bar(x - w, dr_vals,  w,
+           color=[_bar_color(n, "dr")  for n in names], label="Detection Rate (%)")
+    ax.bar(x,     far_vals, w,
+           color=[_bar_color(n, "far") for n in names], label="False Alarm Rate (%)")
+    ax.bar(x + w, f1_vals,  w,
+           color=[_bar_color(n, "f1")  for n in names], label="F1-score (%)")
+
+    # Separator before first California column
+    cal_names = ["Cal. Alg.", "Cal. Alg. (post-hoc)"]
+    first_cal = next((i for i, n in enumerate(names) if n in cal_names), None)
+    if first_cal is not None:
+        ax.axvline(first_cal - 0.5, color="gray", linestyle=":", linewidth=1.2)
+        ax.text(first_cal - 0.42, 104, "Classical baseline →",
+                fontsize=8, color="gray", va="top")
+
+    # Mark post-hoc bar with disclaimer annotation
+    if "Cal. Alg. (post-hoc)" in names:
+        ph_idx = names.index("Cal. Alg. (post-hoc)")
+        ax.text(ph_idx, 106, "⚠ post-hoc", ha="center", fontsize=7, color="gray")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(names, rotation=22, ha="right", fontsize=9)
+    ax.set_ylabel("Percentage (%)")
+    ax.set_title(
+        "Full Model Comparison: ML vs California Algorithm\n"
+        "(California Alg.: locked params from val.h5  |  "
+        "Cal. Alg. post-hoc: test-set sweep ⚠)",
+        fontsize=9,
+    )
+    ax.legend()
+    ax.grid(axis="y", alpha=0.3)
+    ax.set_ylim(0, 114)
+    plt.tight_layout()
+    path = OUTPUT_DIR / "comparison_bar_with_california.png"
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  💾 Extended comparison bar → {path.name}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 8. Main pipeline
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1072,6 +2147,25 @@ def main() -> None:
     fusion_val_df = None
     fusion_test_df = None
     best_w = 0.5   # default for weight-sweep plot
+
+    # California Algorithm — runs in ALL modes (calibration and evaluation).
+    # In calibration: sweeps and saves settings. In evaluation: loads locked settings.
+    # Kept outside the CNN-availability guard so it runs even without CNN.
+    cal_metrics_locked: Optional[dict] = None
+    cal_ttd_locked:     List[Optional[float]] = []
+
+    if mode == "calibration":
+        cal_metrics_locked = run_california_calibration(macro_eng, has_incidents)
+    else:
+        if not CAL_SETTINGS_PATH.exists():
+            print(f"\n  ⚠️  california_settings.json not found — California Algorithm skipped.")
+            print(f"     Run with val.h5 first to calibrate and lock parameters.")
+        else:
+            with open(CAL_SETTINGS_PATH) as _cf:
+                _cal_settings = json.load(_cf)
+            cal_metrics_locked, cal_ttd_locked = run_california_evaluation(
+                macro_eng, _cal_settings, has_incidents,
+            )
 
     if cnn_scen_df is not None:
         # Build joint DataFrame
@@ -1182,6 +2276,14 @@ def main() -> None:
     print("  GENERATING PLOTS")
     print("="*60)
 
+    # Best fusion for confusion matrix (None during calibration is fine)
+    best_fus_for_cm = None
+    if fusion_results:
+        try:
+            best_fus_for_cm = best_fus
+        except NameError:
+            pass
+
     plot_comparison_bar(rf_metrics, cnn_metrics, fusion_results, has_incidents)
 
     if joint_df is not None:
@@ -1190,6 +2292,32 @@ def main() -> None:
         plot_far_vs_threshold(fusion_test_df)
         if mode == "calibration":
             plot_fusion_weight_sweep(fusion_val_df, fusion_test_df, best_w, has_incidents)
+
+    # New diagnostic plots (run in both modes)
+    plot_confusion_matrices(rf_metrics, cnn_metrics, cal_metrics_locked,
+                            best_fus_for_cm, has_incidents)
+
+    if joint_df is not None:
+        plot_precision_recall_curves(joint_df, has_incidents)
+
+    cal_s_for_plots = None
+    if mode == "evaluation" and CAL_SETTINGS_PATH.exists():
+        try:
+            with open(CAL_SETTINGS_PATH) as _f:
+                cal_s_for_plots = json.load(_f)
+        except Exception:
+            pass
+    elif mode == "calibration" and CAL_SETTINGS_PATH.exists():
+        try:
+            with open(CAL_SETTINGS_PATH) as _f:
+                cal_s_for_plots = json.load(_f)
+        except Exception:
+            pass
+
+    plot_ttd_comparison(rf_scen_df, cnn_scen_df, cal_ttd_locked, has_incidents)
+    plot_per_flow_performance(macro_eng, rf_scen_df, cal_s_for_plots, has_incidents)
+    if mode == "evaluation":
+        plot_california_timeseries(macro_eng, cal_s_for_plots)
 
     # ── 8. Save results JSON ──────────────────────────────────────────────
     save_payload = {
@@ -1251,40 +2379,124 @@ def main() -> None:
         dr, far, f1 = fmt(fm, has_incidents)
         name = fm["model"][:22]
         print(f"  {name:<22} {dr:>8} {far:>8} {f1:>8}")
+    if cal_metrics_locked:
+        dr, far, f1 = fmt(cal_metrics_locked, has_incidents)
+        label = (cal_metrics_locked.get("model", "Cal. Alg.") + " (locked)")[:22]
+        print(f"  {label:<22} {dr:>8} {far:>8} {f1:>8}")
+        print(f"  {'':22}   params: {cal_metrics_locked.get('threshold', '')}")
 
     print(f"\n  Output folder : {OUTPUT_DIR}")
     print(f"  Elapsed       : {h:02d}h {m:02d}m {s:02d}s")
     print(f"\n{'='*70}")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # POST-HOC ANALYSES — clearly separated from primary evaluation
+    # These analyses use the SAME test data and are intentionally post-hoc.
+    # Kept separate so the primary locked-threshold results above are
+    # unambiguous for the thesis.  Run only in evaluation mode (not
+    # calibration) to avoid complicating the parameter-selection run.
+    # ═══════════════════════════════════════════════════════════════════════
+
+    if mode == "evaluation":
+        # ── A. Threshold sensitivity sweep ──────────────────────────────────
+        sensitivity_result = None
+        if joint_df is not None and has_incidents:
+            locked_avg_thr = 0.86   # sensible default
+            try:
+                with open(FUSION_SETTINGS_PATH) as _f:
+                    _s = json.load(_f)
+                locked_avg_thr = float(_s["thresholds"]["avg_prob"])
+            except Exception:
+                pass
+            sensitivity_result = run_threshold_sensitivity_analysis(
+                joint_df, locked_avg_thr, has_incidents,
+            )
+
+        # ── B. California Algorithm — post-hoc data-leakage sweep ───────────
+        cal_metrics_posthoc = run_california_posthoc_sweep(macro_eng, has_incidents)
+
+        # ── Extended bar chart (ML + California locked + California post-hoc) ─
+        plot_posthoc_comparison_bar(
+            rf_metrics, cnn_metrics, fusion_results,
+            cal_metrics_posthoc, cal_metrics_locked, has_incidents,
+        )
+
+        # ── Post-hoc summary ────────────────────────────────────────────────
+        elapsed2 = time.time() - wall_start
+        h2, rem2 = divmod(int(elapsed2), 3600)
+        m2, s2   = divmod(rem2, 60)
+
+        print(f"\n{'='*70}")
+        print("  POST-HOC ANALYSIS SUMMARY")
+        print("=" * 70)
+        print("\n  WARNING: Results below used the SAME test set as primary evaluation.")
+        print("  They are exploratory / for thesis discussion only.\n")
+
+        if sensitivity_result:
+            print(f"  [A] Avg-prob threshold sensitivity")
+            print(f"      Locked  : thr={sensitivity_result['locked_threshold']:.2f}  "
+                  f"DR={sensitivity_result['locked_dr']:.1f}%  "
+                  f"FAR={sensitivity_result['locked_far']:.2f}%")
+            if "zero_far_threshold" in sensitivity_result:
+                print(f"      Zero-FAR: thr={sensitivity_result['zero_far_threshold']:.2f}  "
+                      f"DR={sensitivity_result['zero_far_dr']:.1f}%  FAR=0.00%")
+                delta = sensitivity_result["locked_dr"] - sensitivity_result["zero_far_dr"]
+                print(f"      DR cost of moving to FAR=0%: {delta:+.1f} pp")
+
+        if cal_metrics_posthoc:
+            print(f"\n  [B] California Algorithm — post-hoc best config (data-leakage)")
+            print(f"      Parameters: {cal_metrics_posthoc.get('threshold', '')}")
+            if has_incidents:
+                print(f"      DR={cal_metrics_posthoc['dr']:.2%}  "
+                      f"FAR={cal_metrics_posthoc['far']:.2%}  "
+                      f"F1={cal_metrics_posthoc['f1']:.4f}")
+            if cal_metrics_locked and has_incidents:
+                gap = (cal_metrics_posthoc["dr"] - cal_metrics_locked["dr"]) * 100
+                print(f"      Leakage gain vs locked: {gap:+.1f} pp DR  "
+                      f"(locked={cal_metrics_locked['dr']:.2%}, "
+                      f"post-hoc={cal_metrics_posthoc['dr']:.2%})")
+            if fusion_results and has_incidents:
+                constrained_fus = [r for r in fusion_results
+                                    if r["far"] <= MAX_FAR_CONSTRAINT]
+                if constrained_fus:
+                    best_fus_dr = max(r["dr"] for r in constrained_fus)
+                    gap2 = (best_fus_dr - cal_metrics_posthoc["dr"]) * 100
+                    print(f"      ML fusion vs Cal post-hoc: {gap2:+.1f} pp DR "
+                          f"(at FAR<=0.1%)")
+
+        print(f"\n  Post-hoc outputs saved to: {OUTPUT_DIR}")
+        print(f"  Total elapsed : {h2:02d}h {m2:02d}m {s2:02d}s")
+        print(f"\n{'='*70}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # How to run — Calibration → Evaluation workflow
 # ═══════════════════════════════════════════════════════════════════════════════
 #
-# STEP 1 — CALIBRATION  (run once to select fusion parameters)
-#   1. Copy val.h5 into the input folder (test_fusion_input/)
+# STEP 1 — CALIBRATION  (run once with val.h5)
+#   1. Copy val.h5 into test_fusion_input/
 #   2. python test_fusion.py
-#   → Sweeps w and threshold on fusion-val, evaluates on fusion-test (both
-#     halves of val.h5).  Saves fusion_settings.json to the input folder.
+#   → Sweeps fusion w and threshold on val.h5, saves fusion_settings.json.
+#   → Sweeps California Algorithm grid on val.h5, saves california_settings.json.
+#   Both settings files lock ALL parameters before the test set is touched.
 #
-# STEP 2 — EVALUATION on test.h5  (incident scenarios, final thesis numbers)
-#   1. Remove val.h5 from the input folder.
-#   2. Copy test.h5 into the input folder.
-#   3. python test_fusion.py
-#   → Loads fusion_settings.json, applies locked w and thresholds.
-#     Reports DR, FAR, F1 — these are the numbers for your thesis.
+# STEP 2 — EVALUATION on test.h5  (primary thesis numbers)
+#   1. Remove val.h5. Copy test.h5 into test_fusion_input/
+#   2. python test_fusion.py
+#   → Loads fusion_settings.json + california_settings.json (locked).
+#   → Reports DR, FAR, F1 for all models INCLUDING California Algorithm.
+#   → Saves confusion matrices, PR curves, TTD comparison, per-flow chart,
+#     California time-series examples.
+#   → At the end, runs post-hoc sweep (data-leakage) for discussion.
 #
 # STEP 3 — EVALUATION on all_data.h5  (NI set, FAR robustness check)
-#   1. Remove test.h5 from the input folder.
-#   2. Copy all_data.h5 (from --no-incident-only run) into the input folder.
-#   3. python test_fusion.py
-#   → Loads the same fusion_settings.json, reports FAR only (DR = N/A).
-#     This confirms the locked parameters don't trigger false alarms on
-#     real normal traffic.
+#   1. Remove test.h5. Copy all_data.h5 into test_fusion_input/
+#   2. python test_fusion.py
+#   → Same locked parameters — reports FAR only (DR = N/A).
 #
-# To test without the CNN (RF only, much faster):
+# To test without the CNN (RF + California only, much faster):
 #   Simply do not place cnn_model_final.pt / cnn_meta_final.json in the
-#   input folder.  The script will run RF only and skip fusion.
+#   input folder.  The script will run RF and California and skip fusion.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
